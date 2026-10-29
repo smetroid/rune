@@ -1174,9 +1174,26 @@ func (c ideConfig) commandPromptSeparatorCharset() commandPromptSeparatorCharset
 	return out
 }
 
+// commandPromptFrameCharset returns command.frame_charset, whose missing
+// slots keep those of the window frame charset, and whether it is set.
+func (c ideConfig) commandPromptFrameCharset() (component.FrameCharSet, bool) {
+	cmd, ok := c.command()
+	if !ok {
+		return component.FrameCharSet{}, false
+	}
+	cs, err := tconfig.GetFrameCharset(cmd, "frame_charset", c.windowFrameCharset())
+	if err != nil {
+		if err != config.ErrNotFound {
+			c.errors["command.frame_charset"] = err
+		}
+		return component.FrameCharSet{}, false
+	}
+	return cs, true
+}
+
 func (c ideConfig) commandPromptCfg() commandPromptConfig {
 	hintLookup := c.commandKeyBindingHintLookup()
-	return commandPromptConfig{
+	cfg := commandPromptConfig{
 		shader:    c.commandPromptShaderCfg(),
 		separator: c.commandPromptSeparatorCharset(),
 		keyBindingHint: func(line string) string {
@@ -1187,6 +1204,10 @@ func (c ideConfig) commandPromptCfg() commandPromptConfig {
 			Fg: c.commandKeyBindingHintFocusColor(),
 		},
 	}
+	if cs, ok := c.commandPromptFrameCharset(); ok {
+		cfg.frameCharSet = &cs
+	}
+	return cfg
 }
 
 // commandKeyBindingHintColor returns the color of the right-aligned
@@ -2552,27 +2573,80 @@ func (c ideConfig) windowScrollBarAttr() (attr term.Attributes) {
 	return c.windowAttr("scroll_bar_attr", defaultWindowManagerConfig.ScrollBarAttr)
 }
 
-func (c ideConfig) windowScrollBarChar() (ch rune) {
+// windowScrollBarCharsets reads window_manager.scroll_bar_charset. Only
+// older user configurations set scroll_bar_char and scroll_bar_hover_char,
+// so they replace its middle_char and hover_middle_char, which the
+// defaults set. outset is the cells left of the bar that its images
+// cover.
+func (c ideConfig) windowScrollBarCharsets() (
+	cs, hover component.ScrollBarCharSet, outset int,
+) {
+	cs = defaultWindowManagerConfig.ScrollBarCharSet
+	hover = defaultWindowManagerConfig.ScrollBarHoverCharSet
+	outset = defaultWindowManagerConfig.ScrollBarOutset
 	cfg, ok := c.windowManager()
 	if !ok {
 		return
 	}
-	r, err := cfg.GetRune("scroll_bar_char")
-	if err == nil {
-		ch = r
-	}
-	return
-}
+	defer func() {
+		for _, legacy := range []struct {
+			key string
+			dst *rune
+		}{
+			{"scroll_bar_char", &cs.Middle},
+			{"scroll_bar_hover_char", &hover.Middle},
+		} {
+			if r, err := cfg.GetRune(legacy.key); err == nil {
+				*legacy.dst = r
+			}
+		}
+	}()
 
-func (c ideConfig) windowScrollBarHoverChar() (ch rune) {
-	cfg, ok := c.windowManager()
-	if !ok {
+	sub, err := cfg.GetConfig("scroll_bar_charset")
+	if err != nil {
+		if err != config.ErrNotFound {
+			c.errors["window_manager.scroll_bar_charset"] = err
+		}
 		return
 	}
-	r, err := cfg.GetRune("scroll_bar_hover_char")
-	if err == nil {
-		ch = r
+	for _, f := range []struct {
+		key string
+		dst *rune
+	}{
+		{"top_char", &cs.Top},
+		{"middle_char", &cs.Middle},
+		{"bottom_char", &cs.Bottom},
+		{"hover_top_char", &hover.Top},
+		{"hover_middle_char", &hover.Middle},
+		{"hover_bottom_char", &hover.Bottom},
+	} {
+		r, err := sub.GetRune(f.key)
+		if err != nil {
+			if err != config.ErrNotFound {
+				c.errors["window_manager.scroll_bar_charset."+f.key] = err
+			}
+			continue
+		}
+		*f.dst = r
 	}
+
+	g, hg := cs.Graphics, hover.Graphics
+	if err := tconfig.GetGraphics(sub, "graphics", &g.Overlay,
+		tconfig.GraphicsSlot{Key: "top_char", URI: &g.Top},
+		tconfig.GraphicsSlot{Key: "middle_char", URI: &g.Middle},
+		tconfig.GraphicsSlot{Key: "bottom_char", URI: &g.Bottom},
+		tconfig.GraphicsSlot{Key: "hover_top_char", URI: &hg.Top},
+		tconfig.GraphicsSlot{Key: "hover_middle_char", URI: &hg.Middle},
+		tconfig.GraphicsSlot{Key: "hover_bottom_char", URI: &hg.Bottom},
+	); err != nil {
+		c.errors["window_manager.scroll_bar_charset"] = err
+		return
+	}
+	hg.Overlay = g.Overlay
+	cs.Graphics, hover.Graphics = g, hg
+	c.graphicsOutset(sub, "window_manager.scroll_bar_charset",
+		outsetSide{&outset, "left"},
+	)
 	return
 }
 
@@ -2624,7 +2698,60 @@ func (c ideConfig) windowBarCharset() (cs tcomponent.WindowBarCharSet) {
 		}
 		*f.dst = r
 	}
+	g := cs.Graphics
+	if err := tconfig.GetGraphics(sub, "graphics", &g.Overlay,
+		tconfig.GraphicsSlot{Key: "left", URI: &g.Left},
+		tconfig.GraphicsSlot{Key: "horizontal", URI: &g.Horizontal},
+		tconfig.GraphicsSlot{Key: "right", URI: &g.Right},
+	); err != nil {
+		c.errors["window_manager.window_bar_charset"] = err
+		return
+	}
+	c.graphicsOutset(sub, "window_manager.window_bar_charset",
+		outsetSide{&g.Outset.Top, "top"},
+		outsetSide{&g.Outset.Bottom, "bottom"},
+		outsetSide{&g.Outset.Sides, "sides"},
+		outsetSide{&g.Outset.Inward, "inward"},
+		outsetSide{&g.Outset.HorizontalTop, "horizontal_top"},
+	)
+	cs.Graphics = g
 	return
+}
+
+// outsetSide is a side of a graphics outset, read from key into dst.
+type outsetSide struct {
+	dst *int
+	key string
+}
+
+// graphicsOutset reads into sides the "outset" table of cfg's graphics
+// table, reporting its errors under name. Each side is a number of
+// cells, 0 or more; an invalid one is left as it is.
+func (c ideConfig) graphicsOutset(cfg config.Config, name string, sides ...outsetSide) {
+	g, err := cfg.GetConfig("graphics")
+	if err != nil {
+		return
+	}
+	o, err := g.GetConfig("outset")
+	if err != nil {
+		if err != config.ErrNotFound {
+			c.errors[name+".graphics.outset"] = err
+		}
+		return
+	}
+	for _, s := range sides {
+		n, err := o.GetInt(s.key)
+		switch {
+		case errors.Is(err, config.ErrNotFound):
+		case err != nil:
+			c.errors[name+".graphics.outset."+s.key] = err
+		case n < 0:
+			c.errors[name+".graphics.outset."+s.key] = fmt.Errorf(
+				"expected 0 or more cells, got %d", n)
+		default:
+			*s.dst = n
+		}
+	}
 }
 
 // windowCloseIcon reads window_manager.close_icon and returns the
@@ -2798,25 +2925,31 @@ func (c ideConfig) frameUnionCharset() (cs component.FrameUnionCharSet) {
 
 func (c ideConfig) windowManagerConfig() handler.WindowManagerConfig {
 	dim, bw := c.dim()
-	return handler.WindowManagerConfig{
-		Dim:                dim,
-		BW:                 bw,
-		FocusFrameAttr:     c.windowFocusFrameAttr(),
-		FocusFrameCharSet:  c.windowFocusFrameCharset(),
-		ScrollBarHoverChar: c.windowScrollBarHoverChar(),
+	scrollBar, scrollBarHover, scrollBarOutset := c.windowScrollBarCharsets()
+	ret := handler.WindowManagerConfig{
+		Dim:                   dim,
+		BW:                    bw,
+		FocusFrameAttr:        c.windowFocusFrameAttr(),
+		FocusFrameCharSet:     c.windowFocusFrameCharset(),
+		ScrollBarHoverCharSet: scrollBarHover,
 		WindowManagerConfig: tcomponent.WindowManagerConfig{
 			NoMaxSize:        c.windowNoMaxSize(),
 			Frame:            c.frame(),
 			FrameAttr:        c.windowFrameAttr(),
 			FrameCharSet:     c.windowFrameCharset(),
 			ScrollBarAttr:    c.windowScrollBarAttr(),
-			ScrollBarChar:    c.windowScrollBarChar(),
+			ScrollBarCharSet: scrollBar,
+			ScrollBarOutset:  scrollBarOutset,
 			WindowBar:        c.windowBar(),
 			WindowBarCharSet: c.windowBarCharset(),
 			CloseIcon:        c.windowCloseIcon(),
 			CloseIconAttr:    c.windowCloseIconAttr(),
 		},
 	}
+	if c.storage != nil {
+		ret.FrameGraphicsStorage = storageapi.WithPartition(c.storage, frameImagesPartition)
+	}
+	return ret
 }
 
 func (c ideConfig) browser() (config.Config, bool) {
@@ -3596,6 +3729,10 @@ const statusBarImagesPartition = "status_bar_images"
 
 // markdownImagesPartition caches the images markdown view tabs download.
 const markdownImagesPartition = "markdown_images"
+
+// frameImagesPartition caches the images that frame charsets name in
+// their graphics.
+const frameImagesPartition = "frame_images"
 
 func (c ideConfig) auxiliaryBarFolds() bool {
 	cfg, ok := c.auxiliaryBar()

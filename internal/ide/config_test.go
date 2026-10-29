@@ -305,10 +305,18 @@ browser:
             topright: '┓'
             bottomleft: '┗'
             bottomright: '┛'
+            graphics:
+                topleft: 'file:///frames/tl.png'
+                horizontaltop: 'https://example.com/top.png'
         scroll_bar_attr:
             fg: "#f0f0f0"
-        scroll_bar_char: '|'
-        scroll_bar_hover_char: 'X'
+        scroll_bar_charset:
+            top_char: '▲'
+            middle_char: '|'
+            hover_middle_char: 'X'
+            graphics:
+                mode: overlay
+                middle_char: 'file:///frames/bar.png'
         window_bar: true
         window_bar_charset:
             left: '▓'
@@ -1655,15 +1663,23 @@ func TestConfigSetting(t *testing.T) {
 	assert.True(t, term.InputEsc&cfg.inputMode() != 0)
 	assert.Equal(t, "XX", cfg.tabNameSeparator())
 
+	frameCharSet := component.FrameCharSetHighlight()
+	frameCharSet.Graphics.TopLeft = "file:///frames/tl.png"
+	frameCharSet.Graphics.HorizontalTop = "https://example.com/top.png"
 	expectedConfig := handler.WindowManagerConfig{
 		WindowManagerConfig: tcomponent.WindowManagerConfig{
 			Frame:         true,
 			FrameAttr:     term.Attributes{Fg: term.ColorRed},
-			FrameCharSet:  component.FrameCharSetHighlight(),
+			FrameCharSet:  frameCharSet,
 			ScrollBarAttr: term.Attributes{Fg: term.GetColor("#f0f0f0")},
-			ScrollBarChar: '|',
-			NoMaxSize:     true,
-			WindowBar:     true,
+			ScrollBarCharSet: component.ScrollBarCharSet{
+				Top: '▲', Middle: '|',
+				Graphics: component.ScrollBarCharSetGraphics{
+					Middle: "file:///frames/bar.png", Overlay: true,
+				},
+			},
+			NoMaxSize: true,
+			WindowBar: true,
 			WindowBarCharSet: tcomponent.WindowBarCharSet{
 				Left:       '▓',
 				Horizontal: '▒',
@@ -1672,12 +1688,25 @@ func TestConfigSetting(t *testing.T) {
 			CloseIcon:     'x',
 			CloseIconAttr: term.Attributes{Fg: term.ColorYellow},
 		},
-		Dim:                false,
-		ScrollBarHoverChar: 'X',
-		FocusFrameAttr:     handler.DefaultWindowManagerConfig().FrameAttr,
-		FocusFrameCharSet:  handler.DefaultWindowManagerConfig().FrameCharSet,
+		Dim: false,
+		ScrollBarHoverCharSet: component.ScrollBarCharSet{
+			Middle:   'X',
+			Graphics: component.ScrollBarCharSetGraphics{Overlay: true},
+		},
+		FocusFrameAttr:    handler.DefaultWindowManagerConfig().FrameAttr,
+		FocusFrameCharSet: handler.DefaultWindowManagerConfig().FrameCharSet,
 	}
-	assert.Equal(t, expectedConfig, cfg.windowManagerConfig())
+	wmConfig := cfg.windowManagerConfig()
+	// Frame images are cached in a partition of their own.
+	require.NotNil(t, wmConfig.FrameGraphicsStorage)
+	require.NoError(t, wmConfig.FrameGraphicsStorage.Set(context.Background(), "frame", map[string]any{"a": 1}))
+	frameImages, err := cfg.storage.Partition("frame_images")
+	require.NoError(t, err)
+	var frameDoc map[string]any
+	require.NoError(t, frameImages.Get(context.Background(), "frame", &frameDoc))
+	assert.ErrorIs(t, cfg.storage.Get(context.Background(), "frame", &frameDoc), storageapi.ErrNotFound)
+	wmConfig.FrameGraphicsStorage = nil
+	assert.Equal(t, expectedConfig, wmConfig)
 	assert.True(t, cfg.frameUnion())
 
 	expectedIcons := text.IconSet{
@@ -1834,6 +1863,7 @@ func TestConfigSetting(t *testing.T) {
 	expectedFUCs.Right = '┫'
 	expectedFUCs.Top = '┫'
 	expectedFUCs.Bottom = '┫'
+	expectedFUCs.Graphics = frameCharSet.Graphics
 	assert.Equal(t, expectedFUCs, cfg.frameUnionCharset())
 
 	statusBar := cfg.statusBarEnabled()
@@ -2483,6 +2513,336 @@ func TestConfigDim(t *testing.T) {
 				assert.Contains(t, cfg.errors, "window_manager.dim")
 			} else {
 				assert.NotContains(t, cfg.errors, "window_manager.dim")
+			}
+		})
+	}
+}
+
+func TestConfigWindowFrameGraphics(t *testing.T) {
+	def := handler.DefaultWindowManagerConfig()
+	cases := []struct {
+		name      string
+		key       string
+		graphics  map[string]any
+		want      component.FrameCharSetGraphics
+		wantError string
+	}{
+		{
+			name:     "frame charset",
+			key:      "frame_charset",
+			graphics: map[string]any{"topleft": "file:///frames/tl.png"},
+			want:     component.FrameCharSetGraphics{TopLeft: "file:///frames/tl.png"},
+		},
+		{
+			name:     "focus frame charset",
+			key:      "focus_frame_charset",
+			graphics: map[string]any{"verticalright": "https://example.com/right.png"},
+			want:     component.FrameCharSetGraphics{VerticalRight: "https://example.com/right.png"},
+		},
+		{
+			name:      "an invalid URI keeps the default",
+			key:       "frame_charset",
+			graphics:  map[string]any{"topleft": "ftp://example.com/tl.png"},
+			wantError: `graphics.topleft: imageuri: unsupported scheme "ftp"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &ideConfig{cfg: map[string]any{
+				"browser": map[string]any{
+					"window_manager": map[string]any{
+						tc.key: map[string]any{"topleft": "╭", "graphics": tc.graphics},
+					},
+				},
+			}, errors: map[string]error{}}
+
+			wmCfg := cfg.windowManagerConfig()
+			cs := wmCfg.FrameCharSet
+			if tc.key == "focus_frame_charset" {
+				cs = wmCfg.FocusFrameCharSet
+			}
+			assert.Equal(t, tc.want, cs.Graphics)
+			assert.Nil(t, wmCfg.FrameGraphicsStorage, "no storage without ideConfig.storage")
+			errKey := "window_manager." + tc.key
+			if tc.wantError == "" {
+				assert.Equal(t, '╭', cs.TopLeft)
+				assert.NotContains(t, cfg.errors, errKey)
+				return
+			}
+			assert.Equal(t, def.FrameCharSet, cs)
+			assert.ErrorContains(t, cfg.errors[errKey], tc.wantError)
+		})
+	}
+}
+
+func TestConfigWindowScrollBarCharset(t *testing.T) {
+	every := map[string]any{
+		"top_char": "▗", "middle_char": "▐", "bottom_char": "▝",
+		"hover_top_char": "▄", "hover_middle_char": "█", "hover_bottom_char": "▀",
+		"graphics": map[string]any{
+			"mode":              "replace",
+			"top_char":          "file:///bar/top.png",
+			"middle_char":       "file:///bar/middle.png",
+			"bottom_char":       "file:///bar/bottom.png",
+			"hover_top_char":    "file:///bar/hover-top.png",
+			"hover_middle_char": "file:///bar/hover-middle.png",
+			"hover_bottom_char": "file:///bar/hover-bottom.png",
+		},
+	}
+	cases := []struct {
+		name       string
+		wm         map[string]any
+		want       component.ScrollBarCharSet
+		wantHover  component.ScrollBarCharSet
+		wantOutset int
+		wantError  map[string]string
+	}{
+		{
+			name: "unset is the frame's right edge",
+			wm:   map[string]any{},
+		},
+		{
+			name: "every key",
+			wm:   map[string]any{"scroll_bar_charset": every},
+			want: component.ScrollBarCharSet{
+				Top: '▗', Middle: '▐', Bottom: '▝',
+				Graphics: component.ScrollBarCharSetGraphics{
+					Top:    "file:///bar/top.png",
+					Middle: "file:///bar/middle.png",
+					Bottom: "file:///bar/bottom.png",
+				},
+			},
+			wantHover: component.ScrollBarCharSet{
+				Top: '▄', Middle: '█', Bottom: '▀',
+				Graphics: component.ScrollBarCharSetGraphics{
+					Top:    "file:///bar/hover-top.png",
+					Middle: "file:///bar/hover-middle.png",
+					Bottom: "file:///bar/hover-bottom.png",
+				},
+			},
+		},
+		{
+			name: "the older keys are the middle characters",
+			wm: map[string]any{
+				"scroll_bar_char": "|", "scroll_bar_hover_char": "X",
+			},
+			want:      component.ScrollBarCharSet{Middle: '|'},
+			wantHover: component.ScrollBarCharSet{Middle: 'X'},
+		},
+		{
+			name: "the older keys win over the charset",
+			wm: map[string]any{
+				"scroll_bar_char":    "|",
+				"scroll_bar_charset": map[string]any{"middle_char": "▐", "top_char": "▗"},
+			},
+			want: component.ScrollBarCharSet{Top: '▗', Middle: '|'},
+		},
+		{
+			name: "the hover graphics share the mode",
+			wm: map[string]any{"scroll_bar_charset": map[string]any{
+				"graphics": map[string]any{
+					"mode": "overlay", "hover_middle_char": "file:///bar/hover.png",
+				},
+			}},
+			want: component.ScrollBarCharSet{
+				Graphics: component.ScrollBarCharSetGraphics{Overlay: true},
+			},
+			wantHover: component.ScrollBarCharSet{
+				Graphics: component.ScrollBarCharSetGraphics{
+					Middle: "file:///bar/hover.png", Overlay: true,
+				},
+			},
+		},
+		{
+			name: "an invalid character is reported and skipped",
+			wm: map[string]any{"scroll_bar_charset": map[string]any{
+				"middle_char": true, "bottom_char": "▝",
+			}},
+			want: component.ScrollBarCharSet{Bottom: '▝'},
+			wantError: map[string]string{
+				"window_manager.scroll_bar_charset.middle_char": "",
+			},
+		},
+		{
+			name: "invalid graphics keep the characters",
+			wm: map[string]any{"scroll_bar_charset": map[string]any{
+				"middle_char": "▐",
+				"graphics": map[string]any{
+					"middle_char":       "file:///bar/middle.png",
+					"hover_middle_char": "ftp://example.com/hover.png",
+				},
+			}},
+			want: component.ScrollBarCharSet{Middle: '▐'},
+			wantError: map[string]string{
+				"window_manager.scroll_bar_charset": `graphics.hover_middle_char: imageuri: unsupported scheme "ftp"`,
+			},
+		},
+		{
+			name: "an outset stretches the images left",
+			wm: map[string]any{"scroll_bar_charset": map[string]any{
+				"graphics": map[string]any{
+					"middle_char": "file:///bar/middle.png",
+					"outset":      map[string]any{"left": 2},
+				},
+			}},
+			want: component.ScrollBarCharSet{
+				Graphics: component.ScrollBarCharSetGraphics{Middle: "file:///bar/middle.png"},
+			},
+			wantOutset: 2,
+		},
+		{
+			name: "a negative outset is reported and skipped",
+			wm: map[string]any{"scroll_bar_charset": map[string]any{
+				"graphics": map[string]any{
+					"middle_char": "file:///bar/middle.png",
+					"outset":      map[string]any{"left": -1},
+				},
+			}},
+			want: component.ScrollBarCharSet{
+				Graphics: component.ScrollBarCharSetGraphics{Middle: "file:///bar/middle.png"},
+			},
+			wantError: map[string]string{
+				"window_manager.scroll_bar_charset.graphics.outset.left": "expected 0 or more cells, got -1",
+			},
+		},
+		{
+			name: "a charset that is not a map is reported",
+			wm:   map[string]any{"scroll_bar_charset": "▐"},
+			wantError: map[string]string{
+				"window_manager.scroll_bar_charset": "",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &ideConfig{cfg: map[string]any{
+				"browser": map[string]any{"window_manager": tc.wm},
+			}, errors: map[string]error{}}
+
+			wmCfg := cfg.windowManagerConfig()
+			assert.Equal(t, tc.want, wmCfg.ScrollBarCharSet)
+			assert.Equal(t, tc.wantHover, wmCfg.ScrollBarHoverCharSet)
+			assert.Equal(t, tc.wantOutset, wmCfg.ScrollBarOutset)
+			assert.Len(t, cfg.errors, len(tc.wantError))
+			for key, msg := range tc.wantError {
+				if assert.Contains(t, cfg.errors, key) {
+					assert.ErrorContains(t, cfg.errors[key], msg)
+				}
+			}
+		})
+	}
+}
+
+func TestConfigWindowBarGraphics(t *testing.T) {
+	def := handler.DefaultWindowManagerConfig().WindowBarCharSet
+	cases := []struct {
+		name      string
+		charset   map[string]any
+		want      tcomponent.WindowBarCharSet
+		wantError map[string]string
+	}{
+		{
+			name:    "runes alone draw no images",
+			charset: map[string]any{"horizontal": "▀"},
+			want:    tcomponent.WindowBarCharSet{Left: def.Left, Horizontal: '▀', Right: def.Right},
+		},
+		{
+			name: "every slot",
+			charset: map[string]any{"graphics": map[string]any{
+				"mode":       "overlay",
+				"left":       "file:///bar/left.png",
+				"horizontal": "https://example.com/bar/middle.png",
+				"right":      "file:///bar/right.png",
+			}},
+			want: tcomponent.WindowBarCharSet{
+				Left: def.Left, Horizontal: def.Horizontal, Right: def.Right,
+				Graphics: tcomponent.WindowBarGraphics{
+					Left:       "file:///bar/left.png",
+					Horizontal: "https://example.com/bar/middle.png",
+					Right:      "file:///bar/right.png",
+					Overlay:    true,
+				},
+			},
+		},
+		{
+			name: "invalid graphics keep the runes",
+			charset: map[string]any{
+				"left":     "▛",
+				"graphics": map[string]any{"left": "file:///bar/left.png", "right": "/bar/right.png"},
+			},
+			want: tcomponent.WindowBarCharSet{Left: '▛', Horizontal: def.Horizontal, Right: def.Right},
+			wantError: map[string]string{
+				"window_manager.window_bar_charset": `graphics.right: imageuri: unsupported scheme ""`,
+			},
+		},
+		{
+			name: "an outset stretches the ends",
+			charset: map[string]any{"graphics": map[string]any{
+				"left": "file:///bar/left.png",
+				"outset": map[string]any{
+					"top": 1, "bottom": 2.0, "sides": 4, "inward": 3, "horizontal_top": 1,
+				},
+			}},
+			want: tcomponent.WindowBarCharSet{
+				Left: def.Left, Horizontal: def.Horizontal, Right: def.Right,
+				Graphics: tcomponent.WindowBarGraphics{
+					Left: "file:///bar/left.png",
+					Outset: tcomponent.WindowBarOutset{
+						Top: 1, Bottom: 2, Sides: 4, Inward: 3, HorizontalTop: 1,
+					},
+				},
+			},
+		},
+		{
+			name: "invalid outset sides are reported and skipped",
+			charset: map[string]any{"graphics": map[string]any{
+				"left": "file:///bar/left.png",
+				"outset": map[string]any{
+					"top": -1, "bottom": "one", "sides": 2, "inward": -2, "horizontal_top": -3,
+				},
+			}},
+			want: tcomponent.WindowBarCharSet{
+				Left: def.Left, Horizontal: def.Horizontal, Right: def.Right,
+				Graphics: tcomponent.WindowBarGraphics{
+					Left:   "file:///bar/left.png",
+					Outset: tcomponent.WindowBarOutset{Sides: 2},
+				},
+			},
+			wantError: map[string]string{
+				"window_manager.window_bar_charset.graphics.outset.top":            "expected 0 or more cells, got -1",
+				"window_manager.window_bar_charset.graphics.outset.bottom":         config.ErrInvalidType.Error(),
+				"window_manager.window_bar_charset.graphics.outset.inward":         "expected 0 or more cells, got -2",
+				"window_manager.window_bar_charset.graphics.outset.horizontal_top": "expected 0 or more cells, got -3",
+			},
+		},
+		{
+			name: "an outset that is not a map is reported",
+			charset: map[string]any{"graphics": map[string]any{
+				"left": "file:///bar/left.png", "outset": 1,
+			}},
+			want: tcomponent.WindowBarCharSet{
+				Left: def.Left, Horizontal: def.Horizontal, Right: def.Right,
+				Graphics: tcomponent.WindowBarGraphics{Left: "file:///bar/left.png"},
+			},
+			wantError: map[string]string{
+				"window_manager.window_bar_charset.graphics.outset": config.ErrInvalidType.Error(),
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &ideConfig{cfg: map[string]any{
+				"browser": map[string]any{"window_manager": map[string]any{
+					"window_bar_charset": tc.charset,
+				}},
+			}, errors: map[string]error{}}
+
+			assert.Equal(t, tc.want, cfg.windowManagerConfig().WindowBarCharSet)
+			assert.Len(t, cfg.errors, len(tc.wantError))
+			for key, msg := range tc.wantError {
+				if assert.Contains(t, cfg.errors, key) {
+					assert.ErrorContains(t, cfg.errors[key], msg)
+				}
 			}
 		})
 	}
