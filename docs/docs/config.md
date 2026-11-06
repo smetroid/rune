@@ -32,7 +32,7 @@ pulled a change. A workspace config larger than 64 KiB is never applied.
 
 To change your mind, find the decision with `authorizer list` in the
 [console](./learn/console.md#reviewing-permissions-and-trust-with-authorizer),
-revoke it with `authorizer revoke <decision>`, and run `:workspacereload` in
+revoke it with `authorizer revoke <decision>`, and run `workspacereload` in
 that workspace to be asked again.
 
 ## YAML or Starlark?
@@ -70,12 +70,13 @@ comments) is treated as an empty overlay.
 
 ## Applying config changes
 
-Rune does not watch the config file. Open it with `:config`, edit it, save it —
-nothing happens until you reload. There are two levels of reload.
+Rune does not watch the config file. Open it with `config`, edit it, save it —
+nothing happens until you reload. There are two levels of reload, and
+`themereload` applies the appearance keys without either.
 
-### `:workspacereload`
+### `workspacereload`
 
-`:workspacereload` closes the focused workspace and opens it again. The open
+`workspacereload` closes the focused workspace and opens it again. The open
 buffers, cursor positions, window layout and the extension tabs shown in it,
 such as agent chats, are restored, but everything the workspace owns is
 rebuilt from a fresh read of your config file and the workspace's
@@ -96,18 +97,32 @@ surface:
 Only the focused workspace is reloaded; other workspace tabs keep running with
 the configuration they were opened with.
 
+### `themereload`
+
+`themereload` reads the config file again and applies the keys that style
+Rune to every open workspace, with nothing closed or reopened: frames, window
+bars and prompts, notifications, the editor and Rune Agent status bars, the
+Rune Agent compose box frame, the wallpaper, `sounds`, the terminal bell, the
+sounds of program status, and the quick menu, themes and sound volume of the
+GUI. It also reads again every image those keys name.
+[`runectl screenshot`](./develop/runectl.md#screenshots) does the same before
+each capture, which is how Rune Agent checks a theme it is designing; the
+screenshot section lists the exact keys.
+
 ### Restart
 
 Everything that belongs to the process or to the GUI window is built once at
 startup and needs a restart:
 
 - all `gui.*` settings: fonts, themes, ligatures, opacity, blur,
-  scroll multiplier, sound volume, key mapping, quick menu, `gui.env`. Themes and
-  `gui.env` variables added by a package install are available right away
-  (see below).
+  scroll multiplier, sound volume, key mapping, quick menu, `gui.env`.
+  `runectl screenshot` applies the themes, sound volume and quick menu without
+  one, and themes and `gui.env` variables added by a package install are
+  available right away (see below).
 - `log.output_path` and `log.level`
-- `models.*` (the LLM router), `notifications.*`, `telemetry.*`
-- `program_status.*`: the status inbox and the sounds of program status
+- `models.*` (the LLM router), `notifications.auto_close`, `telemetry.*`
+- `program_status.*`: the status inbox, and the sounds of program status
+  unless you run `runectl screenshot`
 - `animations.*`, `workspace.home`, clipboard and macro settings
 - the configuration of the home screen shown when no workspace is open
 

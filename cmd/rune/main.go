@@ -731,18 +731,10 @@ func runGUI(
 		chdirerr = fmt.Errorf("cd %s: %w", home, chdirerr)
 	}
 
-	// The GUI is created after the bootstrap handler, but the IDE may
-	// publish redraw interrupts during its async init before the GUI
-	// exists. guiRef is loaded atomically so those early interrupts are
-	// dropped (superseded by the GUI's initial draw) rather than racing.
+	// The GUI is created after the bootstrap handler, but the IDE starts
+	// publishing events during its init, before the GUI exists.
 	var guiRef atomic.Pointer[gui.GUI]
-	publishEvent := func(ev term.Event) bool {
-		g := guiRef.Load()
-		if g == nil {
-			return false
-		}
-		return g.PublishEvent(ev)
-	}
+	var publisher guiPublisher
 	cellPixelSize := func() (int, int) {
 		g := guiRef.Load()
 		if g == nil {
@@ -780,7 +772,7 @@ func runGUI(
 	root, err := newBootstrapHandler(
 		*flagDataPath, *flagConfigPath,
 		*flagWorkspace, shellRCDir, host, filenames,
-		launchCmd, runner, mu, publishEvent, cellPixelSize,
+		launchCmd, runner, mu, publisher.publish, cellPixelSize,
 		func(u *url.URL) error { return extbrowser.Browse(u) },
 		text.NewAsyncSystemClipboard(), soundOutput, os.TempDir(), rootCfg, trust,
 	)
@@ -811,11 +803,14 @@ func runGUI(
 		reportShellRCErr(browser, shellRCErr)
 	}
 
-	soundOutput.SetVolume(getGUISoundVolume(browser, guiCfg))
+	root.soundVolume = getGUISoundVolume(browser, guiCfg)
+	soundOutput.SetVolume(root.soundVolume)
+	root.defaultTheme = getGUIDefaultColorTheme(browser, guiCfg)
 
 	options := buildGUIOptions(browser, root.config(), guiCfg, transparentWindow, mu, *flagFPS)
 	options = append(options, gui.WithDragObserver(root.dragObserver))
 	options = append(options, gui.WithLinkObserver(root.linkObserver))
+	options = append(options, gui.WithScreenshotDir(filepath.Join(*flagDataPath, "screenshots")))
 
 	storage := root.storage
 	width, height, ok := getLastSize(storage)
@@ -842,8 +837,9 @@ func runGUI(
 	defer func() { _ = root.Close() }()
 	defer func() { _ = g.Close() }()
 	guiRef.Store(g)
+	publisher.attach(g)
 	root.attachGUI(g, transparentWindow)
-	defer watchGUISignals(publishEvent, quitEvent(appMenuKeyBindings(root.config())))()
+	defer watchGUISignals(root, quitEvent(appMenuKeyBindings(root.config())))()
 
 	if fg, bg := getGUIWindowOpacity(browser, guiCfg); transparentWindow && (fg != 1 || bg != 1) {
 		g.SetOpacity(bg, fg)
@@ -874,6 +870,55 @@ func runGUI(
 	saveLastSize(storage, g)
 	saveLastPosition(storage, g)
 	return 0
+}
+
+// eventPublisher is the part of *gui.GUI that guiPublisher publishes to.
+type eventPublisher interface {
+	PublishEvent(ev term.Event) bool
+}
+
+// guiPublisher publishes the IDE's events to the GUI, which runGUI
+// creates after the IDE has started scheduling functions on its event
+// loop.
+type guiPublisher struct {
+	sink atomic.Pointer[eventPublisher]
+	// mu orders the events held before attach ahead of those published
+	// after it.
+	mu      sync.Mutex
+	pending []term.Event
+}
+
+// publish satisfies the IDE's publish-event hook. Before attach it holds
+// the events for attach to publish, except plain redraw interrupts, which
+// it drops because the GUI's first frame supersedes them.
+func (p *guiPublisher) publish(ev term.Event) bool {
+	if sink := p.sink.Load(); sink != nil {
+		return (*sink).PublishEvent(ev)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if sink := p.sink.Load(); sink != nil {
+		return (*sink).PublishEvent(ev)
+	}
+	if ev.Type == term.EventInterrupt && ev.Raw == nil && ev.UserFunc == nil {
+		return false
+	}
+	p.pending = append(p.pending, ev)
+	return true
+}
+
+// attach publishes the events held so far to sink, and every event
+// published from then on.
+func (p *guiPublisher) attach(sink eventPublisher) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, ev := range p.pending {
+		if !sink.PublishEvent(ev) {
+			log.Errorf("publish event held until the GUI started: GUI rejected it")
+		}
+	}
+	p.pending = nil
+	p.sink.Store(&sink)
 }
 
 // buildGUIOptions builds the gui.Option list for the production GUI

@@ -54,6 +54,7 @@ import (
 	tcomponent "unstable.build/rune/internal/component"
 	"unstable.build/rune/internal/component/asciiart"
 	"unstable.build/rune/internal/component/imagecomp"
+	"unstable.build/rune/internal/component/imageuri"
 	"unstable.build/rune/internal/component/notifications"
 	"unstable.build/rune/internal/component/shader/glslshader"
 	"unstable.build/rune/internal/component/shader/shaderloop"
@@ -72,6 +73,7 @@ import (
 	"unstable.build/rune/internal/ide/syntax"
 	"unstable.build/rune/internal/ide/vctrl"
 	"unstable.build/rune/internal/llm"
+	"unstable.build/rune/internal/llm/llmsearch"
 	"unstable.build/rune/internal/sounds"
 	"unstable.build/rune/internal/term/programstatus"
 	"unstable.build/rune/internal/term/vte"
@@ -111,8 +113,11 @@ const (
 
 	keyCommandKeyBindingHintFocusColor = "key_binding_hint_focus_color"
 
-	keyGUI       = "gui"
-	keyQuickMenu = "quick_menu"
+	keyGUI             = "gui"
+	keyQuickMenu       = "quick_menu"
+	keyQuickMenuSounds = "quick_menu_sounds"
+	keyQuickMenuHover  = "hover"
+	keyQuickMenuClick  = "click"
 
 	keySounds       = "sounds"
 	keyTerminal     = "terminal"
@@ -131,13 +136,26 @@ const (
 // C string boundary.
 var quickMenuSymbolRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
-// QuickMenuButton is one button of the native quick menu and the Rune
-// command it runs. Symbol is an SF Symbol name.
+// QuickMenuButton is one button of the quick menu and the Rune command
+// it runs. Symbol is the SF Symbol name the native bar draws. A Sprite
+// has Rune draw the bar instead; either every button has one or none
+// does, and Symbol is empty when it was left out for one.
 type QuickMenuButton struct {
 	Symbol  string
 	Title   string
 	Command []string
+	Sprite  QuickMenuSprite
 }
+
+// QuickMenuSprite is the image URIs a quick menu button shows while
+// idle, under the pointer and pressed. Either all are set or none is.
+type QuickMenuSprite struct {
+	Idle, Hover, Pressed string
+}
+
+// HasSprite reports whether Rune draws the button rather than the
+// native bar.
+func (b QuickMenuButton) HasSprite() bool { return b.Sprite.Idle != "" }
 
 // ID identifies the button to the native bar and keys the key-binding
 // lookup that renders its accelerator.
@@ -152,6 +170,24 @@ func QuickMenuButtons(cfg config.Config) []QuickMenuButton {
 		return nil
 	}
 	return parseQuickMenuButtons(guiCfg, map[string]error{})
+}
+
+// QuickMenuSounds reads `gui.quick_menu_sounds`: the names of the sounds
+// the Rune-drawn quick menu plays when the pointer moves onto a button
+// and when a button is clicked. "" plays none, and so does what is left
+// unset or validateSounds reports.
+func QuickMenuSounds(cfg config.Config) (hover, click string) {
+	guiCfg, err := cfg.GetConfig(keyGUI)
+	if err != nil {
+		return "", ""
+	}
+	soundsCfg, err := guiCfg.GetConfig(keyQuickMenuSounds)
+	if err != nil {
+		return "", ""
+	}
+	hover, _ = soundsCfg.GetString(keyQuickMenuHover)
+	click, _ = soundsCfg.GetString(keyQuickMenuClick)
+	return hover, click
 }
 
 func parseQuickMenuButtons(
@@ -171,6 +207,7 @@ func parseQuickMenuButtons(
 		entries = entries[:maxQuickMenuButtons]
 	}
 	ret := make([]QuickMenuButton, 0, len(entries))
+	paths := make([]string, 0, len(entries))
 	seen := make(map[string]bool, len(entries))
 	for i, entry := range entries {
 		path := fmt.Sprintf("%s.%s[%d]", keyGUI, keyQuickMenu, i)
@@ -188,8 +225,23 @@ func parseQuickMenuButtons(
 		}
 		seen[button.ID()] = true
 		ret = append(ret, *button)
+		paths = append(paths, path)
 	}
-	return ret
+	if !slices.ContainsFunc(ret, QuickMenuButton.HasSprite) {
+		return ret
+	}
+	// The Rune-drawn bar has no SF Symbols to fall back on, so a button
+	// without a sprite could not be drawn at all.
+	kept := ret[:0]
+	for i, button := range ret {
+		if button.HasSprite() {
+			kept = append(kept, button)
+			continue
+		}
+		errs[paths[i]+".sprite"] = errors.New("required because other " +
+			"buttons set one: set a sprite on every button or on none")
+	}
+	return kept
 }
 
 // parseQuickMenuButton returns a nil button when a field-level error was
@@ -201,22 +253,32 @@ func parseQuickMenuButton(
 	m, ok := entry.(map[string]any)
 	if !ok {
 		return nil, errors.New("expected a dict with 'symbol', " +
-			"'title' and 'command' keys")
+			"'title', 'command' and 'sprite' keys")
 	}
 	for key := range m {
 		switch key {
-		case "symbol", "title", "command":
+		case "symbol", "title", "command", "sprite":
 		default:
 			return nil, fmt.Errorf("unknown key %q", key)
 		}
 	}
 
-	symbol, ok := m["symbol"].(string)
-	if !ok {
-		errs[path+".symbol"] = errors.New("required, must be an SF Symbol name")
-		return nil, nil
+	var sprite QuickMenuSprite
+	if raw, ok := m["sprite"]; ok {
+		if sprite, ok = parseQuickMenuSprite(raw, path+".sprite", errs); !ok {
+			return nil, nil
+		}
 	}
-	if !quickMenuSymbolRe.MatchString(symbol) {
+
+	raw, hasSymbol := m["symbol"]
+	symbol, ok := raw.(string)
+	switch {
+	case !hasSymbol && sprite.Idle != "":
+	case !ok:
+		errs[path+".symbol"] = errors.New("must be an SF Symbol name, " +
+			"required unless 'sprite' is set")
+		return nil, nil
+	case !quickMenuSymbolRe.MatchString(symbol):
 		errs[path+".symbol"] = fmt.Errorf(
 			"%q is not a valid SF Symbol name", symbol)
 		return nil, nil
@@ -237,7 +299,65 @@ func parseQuickMenuButton(
 		}
 	}
 
-	return &QuickMenuButton{Symbol: symbol, Title: title, Command: cmdAndArgs}, nil
+	return &QuickMenuButton{
+		Symbol: symbol, Title: title, Command: cmdAndArgs, Sprite: sprite,
+	}, nil
+}
+
+// parseQuickMenuSprite records every error under path and reports
+// whether there were none.
+func parseQuickMenuSprite(
+	raw any, path string, errs map[string]error,
+) (QuickMenuSprite, bool) {
+	m, ok := raw.(map[string]any)
+	if !ok {
+		errs[path] = errors.New("expected a dict with 'idle', 'hover' " +
+			"and 'pressed' image URIs")
+		return QuickMenuSprite{}, false
+	}
+	var sprite QuickMenuSprite
+	ok = true
+	for _, key := range slices.Sorted(maps.Keys(m)) {
+		var slot *string
+		switch key {
+		case "idle":
+			slot = &sprite.Idle
+		case "hover":
+			slot = &sprite.Hover
+		case "pressed":
+			slot = &sprite.Pressed
+		default:
+			errs[path] = fmt.Errorf("unknown key %q", key)
+			ok = false
+			continue
+		}
+		uri, isString := m[key].(string)
+		if !isString {
+			errs[path+"."+key] = errors.New("must be an image URI")
+			ok = false
+			continue
+		}
+		if err := imageuri.ValidateURI(uri); err != nil {
+			errs[path+"."+key] = err
+			ok = false
+			continue
+		}
+		*slot = uri
+	}
+	if !ok {
+		return QuickMenuSprite{}, false
+	}
+	if sprite.Idle == "" {
+		errs[path+".idle"] = errors.New("required")
+		return QuickMenuSprite{}, false
+	}
+	if sprite.Hover == "" {
+		sprite.Hover = sprite.Idle
+	}
+	if sprite.Pressed == "" {
+		sprite.Pressed = sprite.Hover
+	}
+	return sprite, true
 }
 
 func parseQuickMenuCommand(raw any) ([]string, error) {
@@ -495,6 +615,46 @@ func (c ideConfig) llmConfig() llm.Config {
 		}
 	}
 	c.recordLLMValidationError(llm.ValidateConfig(out))
+	return out
+}
+
+// searchConfig returns workspace code search, from llmsearch.DefaultConfig()
+// overlaid with the `search` block. An empty model or a stretch under one
+// character is reported and keeps its default: indexes would otherwise
+// never find a model to encode with, or fail to open.
+func (c ideConfig) searchConfig() llmsearch.Config {
+	out := llmsearch.DefaultConfig()
+	if c.cfg == nil {
+		return out
+	}
+	search, ok := c.getConfig(config.MapConfig(c.cfg), "search")
+	if !ok {
+		return out
+	}
+	overrideBool(search, "semantic_enabled", &out.Enabled)
+	if model, err := search.GetString("model"); err == nil {
+		if model == "" && out.Enabled {
+			c.errors["search.model"] = errors.New("must be set when search.semantic_enabled is True")
+		} else {
+			out.Model = model
+		}
+	}
+	if n, err := search.GetInt("code_stretch"); err == nil {
+		if n <= 0 {
+			c.errors["search.code_stretch"] = fmt.Errorf("expected value > 0, got %d", n)
+		} else {
+			out.Options.CodeStretch = n
+		}
+	}
+	if folders, err := getStringSlice(search, "excluded_folders"); err == nil {
+		out.Options.ExcludedFolders = folders
+	}
+	if exts, err := getStringSlice(search, "excluded_extensions"); err == nil {
+		out.Options.ExcludedExtensions = exts
+	}
+	if d, err := config.GetDuration(search, "idle_timeout", out.Options.IdleTimeout); err == nil {
+		out.Options.IdleTimeout = d
+	}
 	return out
 }
 
@@ -1137,8 +1297,11 @@ func (c ideConfig) commandPromptShaderCfg() commandPromptShaderConfig {
 	return out
 }
 
-func (c ideConfig) commandPromptSeparatorCharset() commandPromptSeparatorCharset {
+func (c ideConfig) commandPromptSeparatorCharset(frame component.FrameCharSet) tcomponent.SeparatorCharSet {
 	out := defaultCommandPromptSeparatorCharset()
+	out.HorizontalLeft, out.HorizontalRight = frame.HorizontalBottom, frame.HorizontalBottom
+	out.Graphics.Horizontal = frame.Graphics.HorizontalBottom
+	out.Graphics.Overlay = frame.Graphics.Overlay
 	cmd, ok := c.command()
 	if !ok {
 		return out
@@ -1171,14 +1334,63 @@ func (c ideConfig) commandPromptSeparatorCharset() commandPromptSeparatorCharset
 		}
 		*f.dst = r
 	}
+	g := out.Graphics
+	if err := tconfig.GetGraphics(cfg, "graphics", &g.Overlay,
+		tconfig.GraphicsSlot{Key: "left", URI: &g.Left},
+		tconfig.GraphicsSlot{Key: "horizontal", URI: &g.Horizontal},
+		tconfig.GraphicsSlot{Key: "right", URI: &g.Right},
+	); err != nil {
+		c.errors["command.separator_charset"] = err
+		return out
+	}
+	c.graphicsOutset(cfg, "graphics", "command.separator_charset",
+		outsetSide{&g.Outset.Top, "top"},
+		outsetSide{&g.Outset.Bottom, "bottom"},
+		outsetSide{&g.Outset.Inward, "inward"},
+	)
+	out.Graphics = g
 	return out
+}
+
+// commandPromptFrameCharset returns command.frame_charset, whose missing
+// slots keep those of the window frame charset, and whether it is set.
+func (c ideConfig) commandPromptFrameCharset() (component.FrameCharSet, bool) {
+	cmd, ok := c.command()
+	if !ok {
+		return component.FrameCharSet{}, false
+	}
+	cs, err := tconfig.GetFrameCharset(cmd, "frame_charset", c.windowFrameCharset())
+	if err != nil {
+		if err != config.ErrNotFound {
+			c.errors["command.frame_charset"] = err
+		}
+		return component.FrameCharSet{}, false
+	}
+	return cs, true
+}
+
+// commandPromptFrame returns command.frame_charset, nil when it is not
+// set, and the separator charset, built on the window frame charset
+// when command.frame_charset is not set.
+func (c ideConfig) commandPromptFrame() (*component.FrameCharSet, tcomponent.SeparatorCharSet) {
+	frame, hasFrame := c.commandPromptFrameCharset()
+	if !hasFrame {
+		frame = c.windowFrameCharset()
+	}
+	separator := c.commandPromptSeparatorCharset(frame)
+	if !hasFrame {
+		return nil, separator
+	}
+	return &frame, separator
 }
 
 func (c ideConfig) commandPromptCfg() commandPromptConfig {
 	hintLookup := c.commandKeyBindingHintLookup()
+	frame, separator := c.commandPromptFrame()
 	return commandPromptConfig{
-		shader:    c.commandPromptShaderCfg(),
-		separator: c.commandPromptSeparatorCharset(),
+		shader:       c.commandPromptShaderCfg(),
+		frameCharSet: frame,
+		separator:    separator,
 		keyBindingHint: func(line string) string {
 			return hintLookup[line]
 		},
@@ -2061,6 +2273,83 @@ func (c ideConfig) promptConfig() browser.PromptConfig {
 	ret.HoverAttr = c.promptHoverAttr()
 	ret.ClickedAttr = c.promptClickedAttr()
 	ret.BackgroundAttr = c.promptBackgroundAttr()
+	ret.Images = c.promptImages()
+	return ret
+}
+
+// hudStyle reads the keys of c that IDE.ApplyHUD applies to running
+// workspaces. It decodes the wallpaper image.
+func (c ideConfig) hudStyle() hudStyle {
+	// windowManagerConfig would open a storage partition that nothing
+	// here closes, and no style needs storage.
+	c.storage = nil
+	frame, separator := c.commandPromptFrame()
+	return hudStyle{
+		browser: browser.Style{
+			WindowManager:     c.windowManagerConfig(),
+			FrameUnionCharSet: c.frameUnionCharset(),
+			Prompt:            c.promptConfig(),
+			Wallpaper:         c.wallpaper(),
+		},
+		commandPromptFrame:     frame,
+		commandPromptSeparator: separator,
+		commandShowManual:      c.commandOverlayShowManual(),
+		statusBar:              c.statusBarStyle(),
+		bellSound:              c.terminalBellSound(),
+		notifications:          c.notificationsStyle(),
+		notifyStatus:           c.statusNotifyConfig(),
+	}
+}
+
+// promptImages reads browser.prompt.images. Every state but idle falls
+// back to another's images, so naming any without idle is an error,
+// which draws no images at all.
+func (c ideConfig) promptImages() browser.PromptImages {
+	cfg, ok := c.prompt()
+	if !ok {
+		return browser.PromptImages{}
+	}
+	images, err := cfg.GetConfig("images")
+	if err != nil {
+		if err != config.ErrNotFound {
+			c.errors["prompt.images"] = err
+		}
+		return browser.PromptImages{}
+	}
+	var ret browser.PromptImages
+	states := []struct {
+		key string
+		dst *browser.PromptButtonImage
+	}{
+		{"idle", &ret.Idle},
+		{"selected", &ret.Selected},
+		{"hover", &ret.Hover},
+		{"pressed", &ret.Pressed},
+	}
+	var errs []error
+	for _, s := range states {
+		if err := tconfig.GetGraphics(images, s.key, nil,
+			tconfig.GraphicsSlot{Key: "left", URI: &s.dst.Left},
+			tconfig.GraphicsSlot{Key: "middle", URI: &s.dst.Middle},
+			tconfig.GraphicsSlot{Key: "right", URI: &s.dst.Right},
+		); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		c.errors["prompt.images"] = errors.Join(errs...)
+		return browser.PromptImages{}
+	}
+	if ret.Idle.Empty() && !ret.Empty() {
+		c.errors["prompt.images.idle"] = errors.New(
+			"expected images for idle buttons, which the other states fall back to")
+		return browser.PromptImages{}
+	}
+	c.graphicsOutset(cfg, "images", "prompt",
+		outsetSide{&ret.Outset.Top, "top"},
+		outsetSide{&ret.Outset.Bottom, "bottom"},
+		outsetSide{&ret.Outset.Sides, "sides"},
+	)
 	return ret
 }
 
@@ -2347,6 +2636,15 @@ func getProgressRunes(c config.Config, def notifications.ProgressRunes) (
 	if err == nil {
 		ret.Start = r
 	}
+	if err := tconfig.GetGraphics(cfg, "graphics", &ret.Graphics.Overlay,
+		tconfig.GraphicsSlot{Key: "start", URI: &ret.Graphics.Start},
+		tconfig.GraphicsSlot{Key: "current", URI: &ret.Graphics.Current},
+		tconfig.GraphicsSlot{Key: "current_tip", URI: &ret.Graphics.CurrentTip},
+		tconfig.GraphicsSlot{Key: "remain", URI: &ret.Graphics.Remain},
+		tconfig.GraphicsSlot{Key: "end", URI: &ret.Graphics.End},
+	); err != nil {
+		return def, err
+	}
 	return ret, nil
 }
 
@@ -2386,18 +2684,26 @@ func (c ideConfig) notificationsDuration(key string, def time.Duration) (ret tim
 
 func (c ideConfig) notificationsConfig() notifications.Config {
 	ret := defaultNotificationsConfig()
+	ret.Style = c.notificationsStyle()
+	ret.AutoClose = c.notificationsDuration("auto_close", ret.AutoClose)
+	return ret
+}
+
+// notificationsStyle reads the keys of notifications that
+// notifications.Container.Restyle applies.
+func (c ideConfig) notificationsStyle() notifications.Style {
+	ret := defaultNotificationsConfig().Style
 	ret.Attributes = c.getConfigAttr("notifications", "attr", ret.Attributes)
 	ret.BackgroundAttributes = c.getConfigAttr("notifications", "background_attr", ret.BackgroundAttributes)
 	ret.FrameCharSet = c.notificationsCharset(ret.FrameCharSet)
 	ret.ProgressBar = c.notificationsBool("progress_bar", ret.ProgressBar)
-	ret.AutoClose = c.notificationsDuration("auto_close", ret.AutoClose)
 	ret.ProgressRunes = c.notificationsProgressRunes(ret.ProgressRunes)
 	ret.Padding = c.notificationsPadding(ret.Padding)
 	setNotificationsColor(&ret)
 	return ret
 }
 
-func setNotificationsColor(ret *notifications.Config) {
+func setNotificationsColor(ret *notifications.Style) {
 	ret.ColorInfo.Bg = ret.BackgroundAttributes.Bg
 	ret.ColorSuccess.Bg = ret.BackgroundAttributes.Bg
 	ret.ColorError.Bg = ret.BackgroundAttributes.Bg
@@ -2552,27 +2858,80 @@ func (c ideConfig) windowScrollBarAttr() (attr term.Attributes) {
 	return c.windowAttr("scroll_bar_attr", defaultWindowManagerConfig.ScrollBarAttr)
 }
 
-func (c ideConfig) windowScrollBarChar() (ch rune) {
+// windowScrollBarCharsets reads window_manager.scroll_bar_charset. Only
+// older user configurations set scroll_bar_char and scroll_bar_hover_char,
+// so they replace its middle_char and hover_middle_char, which the
+// defaults set. outset is the cells left of the bar that its images
+// cover.
+func (c ideConfig) windowScrollBarCharsets() (
+	cs, hover component.ScrollBarCharSet, outset int,
+) {
+	cs = defaultWindowManagerConfig.ScrollBarCharSet
+	hover = defaultWindowManagerConfig.ScrollBarHoverCharSet
+	outset = defaultWindowManagerConfig.ScrollBarOutset
 	cfg, ok := c.windowManager()
 	if !ok {
 		return
 	}
-	r, err := cfg.GetRune("scroll_bar_char")
-	if err == nil {
-		ch = r
-	}
-	return
-}
+	defer func() {
+		for _, legacy := range []struct {
+			key string
+			dst *rune
+		}{
+			{"scroll_bar_char", &cs.Middle},
+			{"scroll_bar_hover_char", &hover.Middle},
+		} {
+			if r, err := cfg.GetRune(legacy.key); err == nil {
+				*legacy.dst = r
+			}
+		}
+	}()
 
-func (c ideConfig) windowScrollBarHoverChar() (ch rune) {
-	cfg, ok := c.windowManager()
-	if !ok {
+	sub, err := cfg.GetConfig("scroll_bar_charset")
+	if err != nil {
+		if err != config.ErrNotFound {
+			c.errors["window_manager.scroll_bar_charset"] = err
+		}
 		return
 	}
-	r, err := cfg.GetRune("scroll_bar_hover_char")
-	if err == nil {
-		ch = r
+	for _, f := range []struct {
+		key string
+		dst *rune
+	}{
+		{"top_char", &cs.Top},
+		{"middle_char", &cs.Middle},
+		{"bottom_char", &cs.Bottom},
+		{"hover_top_char", &hover.Top},
+		{"hover_middle_char", &hover.Middle},
+		{"hover_bottom_char", &hover.Bottom},
+	} {
+		r, err := sub.GetRune(f.key)
+		if err != nil {
+			if err != config.ErrNotFound {
+				c.errors["window_manager.scroll_bar_charset."+f.key] = err
+			}
+			continue
+		}
+		*f.dst = r
 	}
+
+	g, hg := cs.Graphics, hover.Graphics
+	if err := tconfig.GetGraphics(sub, "graphics", &g.Overlay,
+		tconfig.GraphicsSlot{Key: "top_char", URI: &g.Top},
+		tconfig.GraphicsSlot{Key: "middle_char", URI: &g.Middle},
+		tconfig.GraphicsSlot{Key: "bottom_char", URI: &g.Bottom},
+		tconfig.GraphicsSlot{Key: "hover_top_char", URI: &hg.Top},
+		tconfig.GraphicsSlot{Key: "hover_middle_char", URI: &hg.Middle},
+		tconfig.GraphicsSlot{Key: "hover_bottom_char", URI: &hg.Bottom},
+	); err != nil {
+		c.errors["window_manager.scroll_bar_charset"] = err
+		return
+	}
+	hg.Overlay = g.Overlay
+	cs.Graphics, hover.Graphics = g, hg
+	c.graphicsOutset(sub, "graphics", "window_manager.scroll_bar_charset",
+		outsetSide{&outset, "left"},
+	)
 	return
 }
 
@@ -2624,7 +2983,62 @@ func (c ideConfig) windowBarCharset() (cs tcomponent.WindowBarCharSet) {
 		}
 		*f.dst = r
 	}
+	g := cs.Graphics
+	if err := tconfig.GetGraphics(sub, "graphics", &g.Overlay,
+		tconfig.GraphicsSlot{Key: "left", URI: &g.Left},
+		tconfig.GraphicsSlot{Key: "horizontal", URI: &g.Horizontal},
+		tconfig.GraphicsSlot{Key: "right", URI: &g.Right},
+	); err != nil {
+		c.errors["window_manager.window_bar_charset"] = err
+		return
+	}
+	c.graphicsOutset(sub, "graphics", "window_manager.window_bar_charset",
+		outsetSide{&g.Outset.Top, "top"},
+		outsetSide{&g.Outset.Bottom, "bottom"},
+		outsetSide{&g.Outset.Sides, "sides"},
+		outsetSide{&g.Outset.Inward, "inward"},
+		outsetSide{&g.Outset.HorizontalTop, "horizontal_top"},
+	)
+	cs.Graphics = g
 	return
+}
+
+// outsetSide is a side of a graphics outset, read from key into dst.
+type outsetSide struct {
+	dst *int
+	key string
+}
+
+// graphicsOutset reads into sides the "outset" table of cfg's table
+// graphics, reporting its errors under name. Each side is a number of
+// cells, 0 or more; an invalid one is left as it is.
+func (c ideConfig) graphicsOutset(
+	cfg config.Config, graphics, name string, sides ...outsetSide,
+) {
+	g, err := cfg.GetConfig(graphics)
+	if err != nil {
+		return
+	}
+	o, err := g.GetConfig("outset")
+	if err != nil {
+		if err != config.ErrNotFound {
+			c.errors[name+"."+graphics+".outset"] = err
+		}
+		return
+	}
+	for _, s := range sides {
+		n, err := o.GetInt(s.key)
+		key := name + "." + graphics + ".outset." + s.key
+		switch {
+		case errors.Is(err, config.ErrNotFound):
+		case err != nil:
+			c.errors[key] = err
+		case n < 0:
+			c.errors[key] = fmt.Errorf("expected 0 or more cells, got %d", n)
+		default:
+			*s.dst = n
+		}
+	}
 }
 
 // windowCloseIcon reads window_manager.close_icon and returns the
@@ -2798,25 +3212,31 @@ func (c ideConfig) frameUnionCharset() (cs component.FrameUnionCharSet) {
 
 func (c ideConfig) windowManagerConfig() handler.WindowManagerConfig {
 	dim, bw := c.dim()
-	return handler.WindowManagerConfig{
-		Dim:                dim,
-		BW:                 bw,
-		FocusFrameAttr:     c.windowFocusFrameAttr(),
-		FocusFrameCharSet:  c.windowFocusFrameCharset(),
-		ScrollBarHoverChar: c.windowScrollBarHoverChar(),
+	scrollBar, scrollBarHover, scrollBarOutset := c.windowScrollBarCharsets()
+	ret := handler.WindowManagerConfig{
+		Dim:                   dim,
+		BW:                    bw,
+		FocusFrameAttr:        c.windowFocusFrameAttr(),
+		FocusFrameCharSet:     c.windowFocusFrameCharset(),
+		ScrollBarHoverCharSet: scrollBarHover,
 		WindowManagerConfig: tcomponent.WindowManagerConfig{
 			NoMaxSize:        c.windowNoMaxSize(),
 			Frame:            c.frame(),
 			FrameAttr:        c.windowFrameAttr(),
 			FrameCharSet:     c.windowFrameCharset(),
 			ScrollBarAttr:    c.windowScrollBarAttr(),
-			ScrollBarChar:    c.windowScrollBarChar(),
+			ScrollBarCharSet: scrollBar,
+			ScrollBarOutset:  scrollBarOutset,
 			WindowBar:        c.windowBar(),
 			WindowBarCharSet: c.windowBarCharset(),
 			CloseIcon:        c.windowCloseIcon(),
 			CloseIconAttr:    c.windowCloseIconAttr(),
 		},
 	}
+	if c.storage != nil {
+		ret.FrameGraphicsStorage = storageapi.WithPartition(c.storage, frameImagesPartition)
+	}
+	return ret
 }
 
 func (c ideConfig) browser() (config.Config, bool) {
@@ -3404,6 +3824,35 @@ func (c ideConfig) fileExplorerIconAttr() term.Attributes {
 	return attrs
 }
 
+// fileExplorerIconAttrs returns the per-extension icon attributes
+// from editor.file_explorer.icon_attrs, keyed by extension with its
+// leading dot. An invalid entry is reported and skipped so the rest
+// still apply.
+func (c ideConfig) fileExplorerIconAttrs() map[string]term.Attributes {
+	cfg, ok := c.fileExplorer()
+	if !ok {
+		return nil
+	}
+	m, err := cfg.GetMap("icon_attrs")
+	if err != nil {
+		if err != config.ErrNotFound {
+			c.errors["editor.file_explorer.icon_attrs"] = err
+		}
+		return nil
+	}
+	entries := config.MapConfig(m)
+	ret := make(map[string]term.Attributes, len(m))
+	for ext := range m {
+		attrs, err := config.GetAttributes(entries, ext)
+		if err != nil {
+			c.errors["editor.file_explorer.icon_attrs."+ext] = err
+			continue
+		}
+		ret[ext] = attrs
+	}
+	return ret
+}
+
 // fileExplorerReadOnly reports whether the :fexplorer split refuses
 // buffer edits and writes. Defaults to false so the oil.nvim-style
 // editing flow stays on unless the user opts out.
@@ -3575,15 +4024,16 @@ func (c ideConfig) statusBarConfig(
 	cwd workspaceapi.URI, pub text.EventPublisher, svc vctrl.Service,
 	interrupter term.Interrupter,
 ) text.StatusBarConfig {
+	style := c.statusBarStyle()
 	ret := text.StatusBarConfig{
 		Workspace:        cwd,
 		ScheduleNextTick: c.scheduleNextTick,
 		Publisher:        pub,
 		Interrupter:      interrupter,
-		BackgroundColor:  c.statusBarAttr("background_attr", term.Attributes{}).Bg,
-		ErrorColor:       c.statusBarAttr("foreground_error_attr", term.Attributes{}).Fg,
+		BackgroundColor:  style.BackgroundColor,
+		ErrorColor:       style.ErrorColor,
 		GitService:       svc,
-		Layout:           c.statusBarLayout(),
+		Layout:           style.Layout,
 	}
 	if c.storage != nil {
 		ret.Storage = storageapi.WithPartition(c.storage, statusBarImagesPartition)
@@ -3591,11 +4041,25 @@ func (c ideConfig) statusBarConfig(
 	return ret
 }
 
+// statusBarStyle reads the keys of editor.status_bar that a HUD reload
+// restyles open status bars with.
+func (c ideConfig) statusBarStyle() text.StatusBarStyle {
+	return text.StatusBarStyle{
+		Layout:          c.statusBarLayout(),
+		BackgroundColor: c.statusBarAttr("background_attr", term.Attributes{}).Bg,
+		ErrorColor:      c.statusBarAttr("foreground_error_attr", term.Attributes{}).Fg,
+	}
+}
+
 // statusBarImagesPartition caches the images status bar layouts download.
 const statusBarImagesPartition = "status_bar_images"
 
 // markdownImagesPartition caches the images markdown view tabs download.
 const markdownImagesPartition = "markdown_images"
+
+// frameImagesPartition caches the images that frame charsets name in
+// their graphics.
+const frameImagesPartition = "frame_images"
 
 func (c ideConfig) auxiliaryBarFolds() bool {
 	cfg, ok := c.auxiliaryBar()
@@ -4682,6 +5146,25 @@ func (c ideConfig) workspaceSymbolDB() bool {
 	return enabled
 }
 
+// workspaceSearch reports whether workspaces get a semantic search index.
+// Regexp indexing is controlled independently by search.regex_enabled.
+func (c ideConfig) workspaceSearch() bool {
+	return c.searchConfig().Enabled
+}
+
+// workspaceRegexSearch defaults to true; disabling it makes regexp search
+// scan files directly without disabling semantic or symbol indexing.
+func (c ideConfig) workspaceRegexSearch() bool {
+	enabled := true
+	if c.cfg == nil {
+		return enabled
+	}
+	if search, ok := c.getConfig(config.MapConfig(c.cfg), "search"); ok {
+		overrideBool(search, "regex_enabled", &enabled)
+	}
+	return enabled
+}
+
 func (c ideConfig) workspaceWallpaperBackgroundAttr() term.Attributes {
 	return c.getConfigAttr("workspace", "wallpaper_background_attr",
 		term.Attributes{})
@@ -4809,7 +5292,7 @@ func (c ideConfig) terminalBellTrigger() (ret []byte) {
 // terminalBellSound reads terminal.bell, the name of the sound a
 // program ringing the bell plays; "" plays none.
 func (c ideConfig) terminalBellSound() string {
-	ret := vte.DefaultConfig().BellSound
+	ret := *vte.DefaultConfig().BellSound.Load()
 	cfg, ok := c.terminal()
 	if !ok {
 		return ret
@@ -4979,7 +5462,7 @@ func (c ideConfig) terminalConfig() vte.Config {
 	ret.ClipboardAccess = c.terminalClipboardAccess()
 	ret.ScheduleNextTick = c.scheduleNextTick
 	ret.Sounds = c.sounds
-	ret.BellSound = c.terminalBellSound()
+	ret.BellSound.Store(new(c.terminalBellSound()))
 	ret.CellPixelSize = c.cellPixelSize
 	ret.MinWidth = defaultMinWidth
 	ret.Search = c.terminalSearchConfig()
@@ -5223,6 +5706,15 @@ func tabStatusConfigFor(cfg ideConfig) browser.TabStatusConfig {
 		return browser.TabStatusConfig{}
 	}
 	return cfg.tabStatusConfig()
+}
+
+// statusNotifyConfig returns what tabStatusNotifyConfig selects, or
+// nothing when terminal.status is disabled.
+func (c ideConfig) statusNotifyConfig() idestatus.NotifyConfig {
+	if !c.tabStatusEnabled() {
+		return idestatus.NotifyConfig{}
+	}
+	return c.tabStatusNotifyConfig()
 }
 
 // tabStatusNotifyConfig reads terminal.status.notify, the states a tab
@@ -5668,50 +6160,59 @@ const maxWorkspaceConfigSize = 64 << 10
 // that, and c is left untouched unless the whole overlay decodes and
 // validates. A missing or unreadable file is not an error and is not
 // offered to trust; a file over maxWorkspaceConfigSize is an error and is
-// not offered either.
+// not offered either. applied is the contents overlaid onto c, nil when
+// nothing was.
 func loadWorkspaceConfig(
 	filename string, cwd workspace.Workspace, c *ideConfig,
 	trust func(contents []byte) (bool, error),
-) (isConfigErr bool, err error) {
+) (applied []byte, isConfigErr bool, err error) {
 	f, err := cwd.OpenFile(filename, os.O_RDONLY, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
+			return nil, false, nil
 		}
 		if errors.Is(err, os.ErrPermission) {
-			return false, nil
+			return nil, false, nil
 		}
-		return false, fmt.Errorf("failed to open local '%s': %v", filename, err)
+		return nil, false, fmt.Errorf("failed to open local '%s': %v", filename, err)
 	}
 	defer f.Close()
 
 	contents, err := io.ReadAll(io.LimitReader(f, maxWorkspaceConfigSize+1))
 	if err != nil {
-		return false, fmt.Errorf("read '%s': %w", filename, err)
+		return nil, false, fmt.Errorf("read '%s': %w", filename, err)
 	}
 	if len(contents) > maxWorkspaceConfigSize {
-		return false, fmt.Errorf("'%s' is larger than %d KiB, so it is ignored",
+		return nil, false, fmt.Errorf("'%s' is larger than %d KiB, so it is ignored",
 			filename, maxWorkspaceConfigSize>>10)
 	}
 	trusted, err := trust(contents)
 	if err != nil {
-		return false, fmt.Errorf("trust '%s': %w", filename, err)
+		return nil, false, fmt.Errorf("trust '%s': %w", filename, err)
 	}
 	if !trusted {
-		return false, nil
+		return nil, false, nil
 	}
+	if isConfigErr, err := overlayWorkspaceConfig(contents, filename, c); err != nil {
+		return nil, isConfigErr, err
+	}
+	return contents, false, nil
+}
 
+// overlayWorkspaceConfig overlays contents, those of the workspace config
+// filename, onto c. c is left untouched unless the whole overlay decodes
+// and validates; isConfigErr reports that it did not decode.
+func overlayWorkspaceConfig(
+	contents []byte, filename string, c *ideConfig,
+) (isConfigErr bool, err error) {
 	cfg, err := decodeOverlayConfigFile(bytes.NewReader(contents), filename,
 		copyConfigValue(c.cfg).(map[string]any))
 	if err != nil {
 		return true, err
 	}
-
-	err = validateConfig(cfg)
-	if err != nil {
+	if err := validateConfig(cfg); err != nil {
 		return false, fmt.Errorf("validate config: %w", err)
 	}
-
 	c.cfg = cfg
 	return false, nil
 }

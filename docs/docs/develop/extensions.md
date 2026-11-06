@@ -119,9 +119,9 @@ the workspace host: the shell, any wrappers such as `env`, `timeout` or
 `/bin/bash`, `/usr/bin/git`, `/usr/bin/make`. A program you did not expect,
 such as `/home/you/project/git`, stands out there.
 
-When the command runs `rm -r`, the prompt shows each such `rm` under
+When the command runs `rm -r` or `rmdir`, the prompt shows each of them under
 **Removes recursively** as the shell will run it, with the variables it can
-tell expanded: the ones the script sets before the `rm`, and those of the
+tell expanded: the ones the script sets before it, and those of the
 workspace host, such as `$RUNE_DATADIR`. Words it cannot tell, such as
 `$(pwd)`, are left as written.
 
@@ -293,6 +293,13 @@ When you install an extension with `pkg install`, its entry is added for
 you, usually with `path` already set to the installed binary under
 `$RUNE_DATADIR`. In most cases you only ever touch the `config` block to
 tune the extension's own behavior.
+
+An extension reads its `config` block when it starts. Before each
+[`runectl screenshot`](runectl.md#screenshots), Rune reads its config file
+again and tells running extensions; those that support it, such as Rune
+Agent's status bar, apply the new block then (see [Reloading
+configuration](sdk/go.md#reloading-configuration)). Otherwise,
+`extensions restart <id>` picks up the change.
 
 ### Source and package extensions
 

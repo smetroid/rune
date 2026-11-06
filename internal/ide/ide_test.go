@@ -46,6 +46,7 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/api/config"
 	"github.com/unstablebuild/rune-go-sdk/api/extensionapi"
 	"github.com/unstablebuild/rune-go-sdk/api/schemeapi"
+	"github.com/unstablebuild/rune-go-sdk/api/searchapi"
 	"github.com/unstablebuild/rune-go-sdk/api/storageapi"
 	"github.com/unstablebuild/rune-go-sdk/api/storageapi/docmarshal/docbson"
 	"github.com/unstablebuild/rune-go-sdk/api/syntaxapi"
@@ -59,6 +60,7 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/term"
 	"unstable.build/rune/internal/browser"
 	"unstable.build/rune/internal/cell"
+	"unstable.build/rune/internal/codesearch"
 	"unstable.build/rune/internal/component/shader"
 	"unstable.build/rune/internal/debug"
 	"unstable.build/rune/internal/extension"
@@ -73,6 +75,7 @@ import (
 	"unstable.build/rune/internal/ide/syntax/grammarfixture"
 	"unstable.build/rune/internal/ide/syntax/symboldb"
 	"unstable.build/rune/internal/ide/vctrl"
+	"unstable.build/rune/internal/llm/llmsearch"
 	"unstable.build/rune/internal/localstorage"
 	"unstable.build/rune/internal/sounds"
 	"unstable.build/rune/internal/term/vte"
@@ -2497,6 +2500,97 @@ clipboard: memory
 		"symbol database must not be built when workspace.symboldb is unset")
 }
 
+func TestWorkspaceSearchIndexing(t *testing.T) {
+	tests := []struct {
+		name            string
+		config          string
+		regexIndexed    bool
+		semanticIndexed bool
+	}{
+		{"regexp only by default", "clipboard: memory\n", true, false},
+		{"semantic enabled", "clipboard: memory\nsearch:\n  semantic_enabled: true\n", true, true},
+		{"semantic disabled", "clipboard: memory\nsearch:\n  semantic_enabled: false\n", true, false},
+		{"semantic only", "clipboard: memory\nsearch:\n  regex_enabled: false\n  semantic_enabled: true\n", false, true},
+		{"all disabled", "clipboard: memory\nsearch:\n  regex_enabled: false\n  semantic_enabled: false\n", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "invoice.go"),
+				[]byte("package billing\n\n// InvoiceTotal sums the invoice lines and the sales tax.\n"+
+					"func InvoiceTotal() {}\n"), 0o644))
+			dataDir := t.TempDir()
+			configPath := filepath.Join(dataDir, "rune.yaml")
+			require.NoError(t, os.WriteFile(configPath, []byte(tt.config), 0o666))
+
+			mu := new(sync.Mutex)
+			scheduleNextTick, drainSchedule := newTestScheduler(t, mu)
+			i, err := New(dir, configPath, dataDir, pkgtrust.NewStore(), newTestStorage(t, dataDir),
+				WithLocker(mu),
+				WithScheduleNextTick(scheduleNextTick),
+				WithPublishEvent(func(term.Event) bool { return true }),
+			)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = i.Close() })
+			root := i.Ready()
+			mu.Lock()
+			root.Resize(80, 24)
+			mu.Unlock()
+			drainSchedule()
+			i.WaitWorkspaces()
+
+			mu.Lock()
+			wh := i.workspaceHandler.workspaces[i.workspaceHandler.focus]
+			router := i.workspaceHandler.llmRouter
+			home := i.workspaceHandler.homeURI
+			mu.Unlock()
+			require.NotNil(t, wh)
+			_, homeIndexed := router.SearchService().Index(home)
+			assert.False(t, homeIndexed, "the home workspace is never indexed")
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			require.NoError(t, wh.regexIndex.Wait(ctx))
+			assert.Equal(t, tt.regexIndexed, wh.regexIndex.Status().Ready)
+			_, err = os.Stat(codesearch.IndexFile(filepath.Join(dataDir, "codesearch"), wh.uri))
+			assert.Equal(t, tt.regexIndexed, err == nil, "the regex index persists only when regexp indexing is enabled")
+			regexIt, err := wh.regexIndex.RegexpSearch(ctx, searchapi.RegexpRequest{Pattern: `func Invoice\w+`})
+			require.NoError(t, err)
+			lines, err := sdkiterator.ToSlice(ctx, regexIt)
+			require.NoError(t, err)
+			assert.Equal(t, []searchapi.RegexpResult{{
+				Path: "invoice.go", Line: 4, Text: "func InvoiceTotal() {}", Spans: [][2]int{{0, 17}},
+			}}, lines, "searchregex works with or without an index")
+
+			idx, ok := wh.searchIndexCloser.(*llmsearch.Index)
+			require.Equal(t, tt.semanticIndexed, ok)
+			if !tt.semanticIndexed {
+				assert.Nil(t, wh.searchIndexCloser)
+				return
+			}
+
+			require.NoError(t, idx.Wait(ctx))
+			it, _, err := router.SemanticSearch(ctx, wh.uri, searchapi.SemanticRequest{Query: "invoice sales tax"})
+			require.NoError(t, err)
+			hits, err := sdkiterator.ToSlice(ctx, it)
+			require.NoError(t, err)
+			require.NotEmpty(t, hits)
+			assert.Equal(t, "invoice.go", hits[0].Path)
+
+			mu.Lock()
+			_, _, err = i.workspaceHandler.closeWorkspace()
+			mu.Unlock()
+			require.NoError(t, err)
+			i.workspaceHandler.waitClosing()
+			_, open := router.SearchService().Index(wh.uri)
+			assert.False(t, open, "closing the workspace closes its index")
+			_, err = wh.regexIndex.RegexpSearch(ctx, searchapi.RegexpRequest{Pattern: "x"})
+			assert.Error(t, err, "closing the workspace closes its regex index")
+		})
+	}
+}
+
 func TestE2EFileExplorerRefreshDoesNotClobberClipboard(t *testing.T) {
 	rawDir := t.TempDir()
 	dir, err := filepath.EvalSymlinks(rawDir)
@@ -2941,6 +3035,8 @@ func (r testRunner) Run(extensionID, path string, config config.Config) error {
 func (r testRunner) Close() error {
 	return nil
 }
+
+func (r testRunner) SignalReload() int { return 0 }
 
 func (r testRunner) WaitReady(ctx context.Context, id string) error {
 	return nil

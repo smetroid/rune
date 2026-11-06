@@ -39,6 +39,7 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
 	"github.com/unstablebuild/rune-go-sdk/iterator"
 	"unstable.build/rune/cmd/rune-agent/agent/skills"
+	"unstable.build/rune/cmd/rune-agent/agent/toolpolicy"
 	"unstable.build/rune/cmd/rune-agent/dialogue/dialoguemanager"
 	"unstable.build/rune/internal/llm/anthropic"
 )
@@ -363,14 +364,13 @@ func TestAgentRun(t *testing.T) {
 				assert.True(t, hasEventType(events, EventDone))
 
 				// The request should include the old messages + new user message
-				// (skills system message is injected at index 1)
+				// (no skills message: the agent has no skill tool)
 				require.Equal(t, 1, svc.getCallCount())
 				msgs := svc.requests[0].Messages
 				assert.Equal(t, llmapi.RoleSystem, msgs[0].Role)
 				assert.Equal(t, "old system prompt", msgs[0].Content)
-				assert.Equal(t, llmapi.RoleSystem, msgs[1].Role) // skills
-				assert.Equal(t, "previous question", msgs[2].Content)
-				assert.Equal(t, "previous answer", msgs[3].Content)
+				assert.Equal(t, "previous question", msgs[1].Content)
+				assert.Equal(t, "previous answer", msgs[2].Content)
 				assert.Equal(t, "test message", msgs[len(msgs)-1].Content)
 
 				// Should use AppendMessages (existing dialogue)
@@ -469,21 +469,6 @@ func TestAgentRun(t *testing.T) {
 					}
 				}
 				assert.True(t, foundResource, "request should include context resource")
-			},
-		},
-		{
-			name: "default MaxIterations is 500",
-			responses: func() []mockResponse {
-				r := make([]mockResponse, 505)
-				for i := range r {
-					r[i] = toolCallResponse("t", "{}", "c")
-				}
-				return r
-			}(),
-			tools:  []Tool{&mockTool{name: "t", result: ToolResult{Content: "ok"}}},
-			config: Config{SystemPrompt: "test", MaxIterations: 0}, // 0 → default 500
-			assertFn: func(t *testing.T, events []Event, store *mockStore, svc *mockService) {
-				assert.Equal(t, 500, svc.getCallCount())
 			},
 		},
 		{
@@ -2168,14 +2153,12 @@ func TestAgentCompact(t *testing.T) {
 		}
 
 		// post-compact call has compacted summary as user message
-		// (skills system message is injected at index 1)
 		postMsgs := svc.requests[2].Messages
-		require.Len(t, postMsgs, 3)
+		require.Len(t, postMsgs, 2)
 		assert.Equal(t, llmapi.RoleSystem, postMsgs[0].Role)
 		assert.Equal(t, "test system prompt", postMsgs[0].Content)
-		assert.Equal(t, llmapi.RoleSystem, postMsgs[1].Role) // skills
-		assert.Equal(t, llmapi.RoleUser, postMsgs[2].Role)
-		assert.Equal(t, CompactSummaryPrefix+"Summary of work so far", postMsgs[2].Content)
+		assert.Equal(t, llmapi.RoleUser, postMsgs[1].Role)
+		assert.Equal(t, CompactSummaryPrefix+"Summary of work so far", postMsgs[1].Content)
 
 		// Archived dialogue exists with old messages
 		archived, ok := store.getDialogue("d-archived")
@@ -3287,11 +3270,12 @@ Greet the user warmly.
 `), 0o644))
 
 	registry := skills.NewRegistry(osFileSystem{}, dirURI(""), []string{skillDir}, nil)
-	require.Len(t, registry.List(), 3) // greet + builtins (explore, plan)
+	_, ok := registry.Get("greet")
+	require.True(t, ok)
 
 	svc := &mockService{responses: []mockResponse{stopResponse("hi")}}
 	store := newMockStore()
-	ag := NewAgent(svc, NewRegistry(), registry, store, NoMemory(), Config{
+	ag := NewAgent(svc, NewRegistry(&mockTool{name: "skill"}), registry, store, NoMemory(), Config{
 		SystemPrompt: "test",
 	})
 
@@ -3305,6 +3289,8 @@ Greet the user warmly.
 	assert.Equal(t, llmapi.RoleSystem, req.Messages[1].Role)
 	assert.Contains(t, req.Messages[1].Content, "greet")
 	assert.Contains(t, req.Messages[1].Content, "skill tool")
+	assert.Contains(t, req.Messages[1].Content, "- rune-hud:")
+	assert.Contains(t, req.Messages[1].Content, "<builtin>/rune-hud/SKILL.md")
 
 	// The persisted messages should NOT contain the skills message.
 	d, ok := store.getDialogue("d")
@@ -3517,7 +3503,7 @@ func TestCommitAttributionInjectedWithoutPersistence(t *testing.T) {
 func TestSkillsNotInjectedWhenEmpty(t *testing.T) {
 	svc := &mockService{responses: []mockResponse{stopResponse("hi")}}
 	reg := skills.NewRegistry(nopFileSystem{}, dirURI(""), nil, nil)
-	ag := NewAgent(svc, NewRegistry(), reg, newMockStore(), NoMemory(), Config{
+	ag := NewAgent(svc, NewRegistry(&mockTool{name: "skill"}), reg, newMockStore(), NoMemory(), Config{
 		SystemPrompt: "test",
 	})
 
@@ -3535,15 +3521,107 @@ func TestSkillsNotInjectedWhenEmpty(t *testing.T) {
 	assert.Contains(t, req.Messages[1].Content, "plan")
 }
 
+func TestSkillsListFollowsTheToolPolicy(t *testing.T) {
+	skillDir := t.TempDir()
+	for _, name := range []string{"acme-notes", "other"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(skillDir, name), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(skillDir, name, "SKILL.md"),
+			[]byte("---\nname: "+name+"\ndescription: The "+name+" skill\n---\nbody\n"), 0o644))
+	}
+	reg := skills.NewRegistry(osFileSystem{}, dirURI(""), []string{skillDir}, nil)
+	acmeOnly, err := toolpolicy.Parse([]string{"read_file", "skill(acme-*)"}, nil)
+	require.NoError(t, err)
+
+	cases := []struct {
+		name    string
+		tools   []Tool
+		policy  toolpolicy.Policy
+		want    []string
+		notWant []string
+	}{
+		{name: "every skill without a policy", tools: []Tool{&mockTool{name: "skill"}},
+			want: []string{"acme-notes:", "other:", "rune-hud:", "explore (agent)"}},
+		{name: "only the skills the policy allows", tools: []Tool{&mockTool{name: "skill"}},
+			policy: acmeOnly, want: []string{"acme-notes:"},
+			notWant: []string{"other", "rune-hud", "explore"}},
+		{name: "none without a skill tool", tools: []Tool{&mockTool{name: "read_file"}},
+			notWant: []string{"acme-notes", "skill tool"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &mockService{responses: []mockResponse{stopResponse("hi")}}
+			ag := NewAgent(svc, NewRegistry(tc.tools...), reg, newMockStore(), NoMemory(), Config{
+				SystemPrompt: "test", Tools: tc.policy,
+			})
+			_ = collectEvents(t, ag.Run(context.Background(), "d", "hello"))
+
+			require.Equal(t, 1, svc.getCallCount())
+			var system []string
+			for _, m := range svc.requests[0].Messages {
+				if m.Role == llmapi.RoleSystem {
+					system = append(system, m.Content)
+				}
+			}
+			all := strings.Join(system, "\n")
+			for _, w := range tc.want {
+				assert.Contains(t, all, "- "+w)
+			}
+			for _, w := range tc.notWant {
+				assert.NotContains(t, all, w)
+			}
+		})
+	}
+}
+
+func TestAgentRun_UnlimitedIterations(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		config Config
+	}{
+		{name: "default", config: Config{SystemPrompt: "test"}},
+		{name: "explicit zero", config: Config{SystemPrompt: "test", MaxIterations: 0}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			responses := make([]mockResponse, 501)
+			for i := range responses {
+				responses[i] = toolCallResponse("t", "{}", fmt.Sprintf("c%d", i))
+			}
+			responses = append(responses, stopResponse("Done!"))
+			svc := &mockService{responses: responses}
+			store := newMockStore()
+			registry := NewRegistry(&mockTool{name: "t", result: ToolResult{Content: "ok"}})
+			ag := NewAgent(svc, registry, noSkills(), store, NoMemory(), tt.config)
+
+			events := collectEvents(t, ag.Run(context.Background(), "d", "keep going"))
+
+			assert.Equal(t, len(responses), svc.getCallCount())
+			assert.Empty(t, eventsByType(events, EventError))
+			assert.Len(t, eventsByType(events, EventToolResult), 501)
+			assert.Len(t, eventsByType(events, EventDone), 1)
+			d, ok := store.getDialogue("d")
+			require.True(t, ok)
+			require.NotEmpty(t, d.Messages)
+			assert.Equal(t, "Done!", d.Messages[len(d.Messages)-1].Content)
+		})
+	}
+}
+
 func TestNewAgent_DefaultMaxIterations(t *testing.T) {
-	ag := NewAgent(&mockService{}, NewRegistry(), noSkills(), newMockStore(), NoMemory(), Config{MaxIterations: 0})
-	assert.Equal(t, 500, ag.config.MaxIterations)
-
-	ag2 := NewAgent(&mockService{}, NewRegistry(), noSkills(), newMockStore(), NoMemory(), Config{MaxIterations: -5})
-	assert.Equal(t, 500, ag2.config.MaxIterations)
-
-	ag3 := NewAgent(&mockService{}, NewRegistry(), noSkills(), newMockStore(), NoMemory(), Config{MaxIterations: 10})
-	assert.Equal(t, 10, ag3.config.MaxIterations)
+	for _, tt := range []struct {
+		name   string
+		config Config
+		want   int
+	}{
+		{name: "default", config: Config{}, want: 0},
+		{name: "explicit zero", config: Config{MaxIterations: 0}, want: 0},
+		{name: "negative uses default", config: Config{MaxIterations: -5}, want: 0},
+		{name: "positive limit", config: Config{MaxIterations: 10}, want: 10},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ag := NewAgent(&mockService{}, NewRegistry(), noSkills(), newMockStore(), NoMemory(), tt.config)
+			assert.Equal(t, tt.want, ag.config.MaxIterations)
+		})
+	}
 }
 
 func TestAgentMaxOutputTokens(t *testing.T) {
@@ -3833,6 +3911,14 @@ type mockResponse struct {
 	// tests can simulate an Anthropic extended-thinking stream whose signed
 	// thinking blocks must be replayed on the next request.
 	reasoningBlocks []llmapi.ReasoningBlock
+}
+
+func (m *mockService) CanGenerateImages(context.Context, llmapi.ModelEntry) (bool, error) {
+	return false, nil
+}
+
+func (m *mockService) GenerateImage(context.Context, llmapi.ModelEntry, llmapi.ImageRequest) (llmapi.Image, error) {
+	return llmapi.Image{}, llmapi.ErrImageGenerationUnsupported
 }
 
 func (m *mockService) CreateCompletion(
@@ -4284,6 +4370,14 @@ func TestStreamReset(t *testing.T) {
 // EventStreamReset for testing mid-stream retry handling in the agent.
 type streamResetMockService struct {
 	events []llmapi.Event
+}
+
+func (m *streamResetMockService) CanGenerateImages(context.Context, llmapi.ModelEntry) (bool, error) {
+	return false, nil
+}
+
+func (m *streamResetMockService) GenerateImage(context.Context, llmapi.ModelEntry, llmapi.ImageRequest) (llmapi.Image, error) {
+	return llmapi.Image{}, llmapi.ErrImageGenerationUnsupported
 }
 
 func (m *streamResetMockService) CreateCompletion(

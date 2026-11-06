@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image"
 	"maps"
 	"net/http"
 	"net/url"
@@ -53,6 +54,7 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 	"unstable.build/rune/internal/browser"
 	"unstable.build/rune/internal/cell"
+	tcomponent "unstable.build/rune/internal/component"
 	fileexplorercomp "unstable.build/rune/internal/component/fileexplorer"
 	"unstable.build/rune/internal/component/markdown"
 	"unstable.build/rune/internal/component/notifications"
@@ -207,6 +209,13 @@ type ex struct {
 	promptMouseDown  bool
 	promptShader     *shader.Component
 	commandPromptCfg commandPromptConfig
+	// graphics draws the images of the command prompt and of the
+	// notifications. It is nil until either names one.
+	graphics        *tcomponent.FrameGraphics
+	graphicsStorage storageapi.Service
+	// statusBars styles the status bars of the editors e opens. It is
+	// nil where they are not restyled.
+	statusBars *text.StatusBarStyles
 	// editorModeModal records whether the editor backing this ex runs in
 	// modal mode. The cheatsheet uses it to gate modal-only key tips.
 	editorModeModal bool
@@ -289,6 +298,7 @@ func newEx(
 	commandObserver commandObserver,
 	debugCommands bool,
 	commandPromptCfg commandPromptConfig,
+	notificationsStyle notifications.Style,
 	editorModeModal bool,
 	editorMode string,
 	metaKey keymeta.Meta,
@@ -311,6 +321,7 @@ func newEx(
 	e.commandObserver = commandObserver
 	e.debugCommands = debugCommands
 	e.commandPromptCfg = commandPromptCfg
+	e.container.Restyle(notificationsStyle)
 	e.editorModeModal = editorModeModal
 	e.editorMode = editorMode
 	e.metaKey = metaKey
@@ -437,13 +448,13 @@ func (e *ex) init(
 	// "!" plugins float with a window bar that shows the command as
 	// its title, so drop the command from the plugin's own bar. Task
 	// windows keep it: they can be tiled, where there is no bar.
-	floatPluginOpts := pluginOpts
-	if e.config.WindowManagerConfig.Frame &&
-		e.config.WindowManagerConfig.WindowBar {
-		floatPluginOpts = append(slices.Clip(pluginOpts),
-			plugin.WithoutBarCommand())
-	}
 	e.newPluginHandler = func(width int, args ...string) (pluginHandler, error) {
+		floatPluginOpts := pluginOpts
+		if e.config.WindowManagerConfig.Frame &&
+			e.config.WindowManagerConfig.WindowBar {
+			floatPluginOpts = append(slices.Clip(pluginOpts),
+				plugin.WithoutBarCommand())
+		}
 		h, err := plugin.New(e.Browser(), e.Browser(), e.executor, e.terminal,
 			e.tm, args, width, floatPluginOpts...)
 		if err != nil {
@@ -575,11 +586,13 @@ func (e *ex) doInit(
 	e.stepWaitTimeout = e.pluginWaitTimeout + 30*time.Second
 	e.clip = clip
 	e.workspace = m
-	e.container = notifications.New(&e.comp, n.cfg)
+	e.storage = storage
+	notiCfg := n.cfg
+	notiCfg.Graphics = e.frameGraphics
+	e.container = notifications.New(&e.comp, notiCfg)
 	e.notifications = n.new(uri, e.container)
 	e.terminal = newAsyncTerminal(m, e.notifications)
 	e.publishEvent = publishEvent
-	e.storage = storage
 	e.workspaceURI = uri
 	// A t=f, t=t or t=s graphics transmission names a file on the
 	// machine the terminal's command runs on, which is this workspace.
@@ -2260,6 +2273,7 @@ func (e *ex) initFileExplorer() error {
 			IndentWidth: e.config.Tabspaces,
 			IndentAttr:  e.config.FileExplorer.IndentAttr,
 			IconAttr:    e.config.FileExplorer.IconAttr,
+			IconAttrs:   e.config.FileExplorer.IconAttrs,
 			Ignore:      ignore,
 		})
 		if err != nil {
@@ -3122,7 +3136,7 @@ func (e *ex) newCommandPrompt(reset func(*command.Prompt)) {
 	commandCfg.ElementAttr = e.config.CommandOverlay.ElementAttr
 	commandCfg.ManualAttr = e.config.CommandOverlay.ManualAttr
 	commandCfg.DocumentID = commandHistoryDocumentID
-	commandCfg.FrameCharSet = e.config.FrameCharSet
+	commandCfg.FrameCharSet, _ = e.promptFrameCharSets()
 	commandCfg.FrameAttr = e.config.FrameAttr
 	commandCfg.ShowManual = e.config.CommandOverlay.ShowManual
 	commandCfg.ShowProgressHint = e.config.CommandOverlay.ShowProgressHint
@@ -3322,8 +3336,9 @@ func (e *ex) startPromptShader() {
 	offset := e.cmdV.Position()
 	offset.X += wmOff.X
 	offset.Y += wmOff.Y
+	_, radar := e.promptFrameCharSets()
 	e.promptShader = newPromptShader(
-		e.config.FocusFrameCharSet, e.config.FrameAttr,
+		radar, e.config.FrameAttr, e.commandPromptCfg.separator,
 		e.cmdWin, offset, drawFunc(e.drawCmdPrompt), e,
 		e.commandPromptCfg.shader,
 	)
@@ -3430,6 +3445,15 @@ func (e *ex) Close() (ret error) {
 		ret = multierror.Append(ret, err)
 	}
 	e.stopPromptShader()
+	if e.graphics != nil {
+		if err := e.graphics.Close(); err != nil {
+			ret = multierror.Append(ret, err)
+		}
+		if err := e.graphicsStorage.Close(); err != nil {
+			ret = multierror.Append(ret, err)
+		}
+		e.graphics, e.graphicsStorage = nil, nil
+	}
 	if err := e.container.Close(); err != nil {
 		ret = multierror.Append(ret, err)
 	}
@@ -3445,6 +3469,53 @@ func (e *ex) Close() (ret error) {
 func (e *ex) cleanPartialReissueState() {
 	e.cancelPartialReissue = nil
 	e.ctxPartialReissue = context.Background()
+}
+
+func (e *ex) frameGraphics() *tcomponent.FrameGraphics {
+	if e.graphics == nil {
+		e.graphicsStorage = storageapi.WithPartition(e.storage, frameImagesPartition)
+		e.graphics = tcomponent.NewFrameGraphics(e.graphicsStorage, e)
+	}
+	return e.graphics
+}
+
+// promptFrameCharSets returns the charset the command prompt draws its frame
+// with, and the one whose runes its radar shades.
+func (e *ex) promptFrameCharSets() (frame, radar component.FrameCharSet) {
+	if cs := e.commandPromptCfg.frameCharSet; cs != nil {
+		return *cs, *cs
+	}
+	return e.config.FrameCharSet, e.config.FocusFrameCharSet
+}
+
+// restyle draws e with s from the next Draw on, as browser.Component.Restyle
+// does, and the command prompts it opens later, and its notifications,
+// open and later. Its frames, prompt buttons and notifications draw
+// images as tcomponent.FrameGraphics.Reload takes them.
+// Its editor status bars, open and later, draw statusBarImages as
+// text.StatusBarStyles.Restyle takes them, and its terminals, open and
+// later, ring the bell with s's sound.
+func (e *ex) restyle(s hudStyle, images, statusBarImages map[string]image.Image) {
+	e.config.Config = e.config.Config.Restyled(s.browser)
+	e.config.CommandOverlay.ShowManual = s.commandShowManual
+	e.commandPromptCfg.frameCharSet = s.commandPromptFrame
+	e.commandPromptCfg.separator = s.commandPromptSeparator
+	if e.emulatorConfig.BellSound != nil {
+		e.emulatorConfig.BellSound.Store(new(s.bellSound))
+	}
+	e.comp.Browser().Restyle(s.browser)
+	e.cmdV.C.Restyle(s.browser)
+	e.container.Restyle(s.notifications)
+	for _, g := range []*tcomponent.FrameGraphics{
+		e.comp.Browser().FrameGraphics(), e.cmdV.C.FrameGraphics(), e.graphics,
+	} {
+		if g != nil {
+			g.Reload(images)
+		}
+	}
+	if e.statusBars != nil {
+		e.statusBars.Restyle(s.statusBar, statusBarImages)
+	}
 }
 
 // stopTerminal releases the pty-resize worker. It is safe to call on a

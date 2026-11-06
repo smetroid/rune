@@ -1177,7 +1177,9 @@ func TestWindowManagerCloseDropsWindow(t *testing.T) {
 			return win
 		}},
 		{"prompt is dismissed", func(t *testing.T, b *Component) Window {
-			return b.Prompt("Proceed?", []string{"Yes", "No"}, nil, handler.NopPromptHandler())
+			return b.Prompt(browserapi.PromptConfig{
+				Message: "Proceed?", Options: []string{"Yes", "No"},
+			}, handler.NopPromptHandler())
 		}},
 	}
 	for _, tt := range tests {
@@ -1567,8 +1569,8 @@ func newActivityComponent(t *testing.T, onActivity func()) (*Component, []*Tab) 
 			onActivity()
 		}
 	}
+	cfg.Interrupter = term.NopInterrupter()
 	b := NewComponent(cfg)
-	b.SetInterrupter(term.NopInterrupter())
 	b.Resize(40, 10)
 	t.Cleanup(func() { _ = b.Close() })
 	var tabs []*Tab
@@ -1677,8 +1679,8 @@ func TestOnTabRemoved(t *testing.T) {
 		cfg.OnTabRemoved = func(uri workspaceapi.URI) {
 			*events = append(*events, "removed "+name(uri))
 		}
+		cfg.Interrupter = term.NopInterrupter()
 		b := NewComponent(cfg)
-		b.SetInterrupter(term.NopInterrupter())
 		b.Resize(80, 24)
 		t.Cleanup(func() { _ = b.Close() })
 		f := fixture{
@@ -1965,9 +1967,10 @@ func TestRemoveTabClearsStatus(t *testing.T) {
 	assert.False(t, b.HasWorkingTabs())
 }
 
-func TestSetInterrupterStartsPendingActivity(t *testing.T) {
+func TestCloseStopsTabActivity(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ActiveTabShader = "pulse"
+	cfg.Interrupter = term.NopInterrupter()
 	b := NewComponent(cfg)
 	uri, err := workspaceapi.ParseURI("file:///a")
 	require.NoError(t, err)
@@ -1976,12 +1979,12 @@ func TestSetInterrupterStartsPendingActivity(t *testing.T) {
 
 	working := programstatus.Report{State: programstatus.Working, Progress: -1}
 	require.True(t, b.SetTabStatus(uri, working))
-	assert.False(t, b.shadedTabs.Running())
-	b.SetInterrupter(term.NopInterrupter())
-	assert.True(t, b.shadedTabs.Running())
+	require.True(t, b.shadedTabs.Running())
+	require.NotNil(t, b.spinner)
 
 	require.NoError(t, b.Close())
 	assert.False(t, b.shadedTabs.Running())
+	assert.Nil(t, b.spinner)
 }
 
 // newStatusComponent returns a frameless Component with the tabs
@@ -1995,8 +1998,8 @@ func newStatusComponent(t *testing.T) (*Component, []*Tab, func() []term.Cell) {
 	cfg.FrameUnion = false
 	cfg.Dim = false
 	cfg.ActiveTabShader = "pulse"
+	cfg.Interrupter = term.NopInterrupter()
 	b := NewComponent(cfg)
-	b.SetInterrupter(term.NopInterrupter())
 	t.Cleanup(func() { _ = b.Close() })
 
 	uriA, err := workspaceapi.ParseURI("file:///a")
@@ -2258,8 +2261,8 @@ func TestSetTabStatusSpinnerCycles(t *testing.T) {
 func TestSetTabStatusWithoutSpinnerKeepsIcon(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.TabStatus.Spinner = nil
+	cfg.Interrupter = term.NopInterrupter()
 	b := NewComponent(cfg)
-	b.SetInterrupter(term.NopInterrupter())
 	t.Cleanup(func() { _ = b.Close() })
 	uri, err := workspaceapi.ParseURI("file:///a")
 	require.NoError(t, err)
@@ -3563,8 +3566,8 @@ func TestTabStatusRecords(t *testing.T) {
 	cfg.OnTabStatus = func(_ workspaceapi.URI, _, status programstatus.Summary) {
 		changes = append(changes, status)
 	}
+	cfg.Interrupter = term.NopInterrupter()
 	b := NewComponent(cfg)
-	b.SetInterrupter(term.NopInterrupter())
 	b.Resize(40, 10)
 	t.Cleanup(func() { _ = b.Close() })
 	uri, err := workspaceapi.ParseURI("rune-agent://model/chat")
@@ -3787,8 +3790,8 @@ func TestContentSeen(t *testing.T) {
 			var seen []browserapi.Handler
 			cfg := DefaultConfig()
 			cfg.OnContentSeen = func(content browserapi.Handler) { seen = append(seen, content) }
+			cfg.Interrupter = term.NopInterrupter()
 			b := NewComponent(cfg)
-			b.SetInterrupter(term.NopInterrupter())
 			b.Resize(60, 20)
 			t.Cleanup(func() { _ = b.Close() })
 			uri, err := workspaceapi.ParseURI("rune-agent://model/chat")
@@ -3932,8 +3935,8 @@ func newPointerComponent(t *testing.T, tabBarOffset int) *Component {
 	cfg.TabBarOffset = tabBarOffset
 	cfg.WindowManagerConfig.WindowBar = true
 	cfg.OnTabIconClick = func(*Tab) {}
+	cfg.Interrupter = term.NopInterrupter()
 	b := NewComponent(cfg)
-	b.SetInterrupter(term.NopInterrupter())
 	b.Resize(60, 15)
 	t.Cleanup(func() { _ = b.Close() })
 
@@ -3959,8 +3962,9 @@ func newPointerComponent(t *testing.T, tabBarOffset int) *Component {
 	b.Bar(browserapi.BarConfig{Orientation: browserapi.OrientationLeft, Size: 3},
 		NopHandler(newPointerLess(t)))
 	b.Floating(StaticFloating(NopHandler(newPointerLess(t)), 20, 6), browserapi.FloatingConfig{})
-	b.Prompt("Proceed with a rather long question?", []string{"Yes", "No"}, nil,
-		handler.NopPromptHandler())
+	b.Prompt(browserapi.PromptConfig{
+		Message: "Proceed with a rather long question?", Options: []string{"Yes", "No"},
+	}, handler.NopPromptHandler())
 	b.SetFocus(left)
 	return b
 }
@@ -3989,8 +3993,10 @@ func TestComponentPointerLeaves(t *testing.T) {
 func TestComponentContentPointerLeaves(t *testing.T) {
 	for _, size := range [][2]int{{60, 15}, {1, 1}} {
 		b := newPointerComponent(t, 0)
-		prompt := b.Prompt("Another long question for the prompt?", []string{"Yes", "No", "Maybe"},
-			nil, handler.NopPromptHandler())
+		prompt := b.Prompt(browserapi.PromptConfig{
+			Message: "Another long question for the prompt?",
+			Options: []string{"Yes", "No", "Maybe"},
+		}, handler.NopPromptHandler())
 		var contents []tui.Handler
 		for _, win := range []Window{prompt, b.Focus()} {
 			h, err := win.Content()

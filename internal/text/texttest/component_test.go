@@ -57,6 +57,7 @@ import (
 	"unstable.build/rune/internal/handler/handlertest"
 	hmarkdown "unstable.build/rune/internal/handler/markdown"
 	"unstable.build/rune/internal/ide/idecmd"
+	"unstable.build/rune/internal/term/programstatus"
 	"unstable.build/rune/internal/text"
 	"unstable.build/rune/internal/text/standard"
 	"unstable.build/rune/internal/workspace"
@@ -354,6 +355,76 @@ func TestComponentInterfaces(t *testing.T) {
 	ed.Edit(context.Background(), workspaceapi.URI{}, cell.NewBuffer(), false, false)
 	_, _ = b.Focus()
 	comp.Resize(0, 0)
+}
+
+func TestComponentPromptOpensLinksWithOnLinkClick(t *testing.T) {
+	const width, height = 60, 20
+	const link = "https://example.com/advisory"
+	var opened []string
+	cfg := text.DefaultConfig()
+	cfg.OnLinkClick = func(u *url.URL) bool {
+		opened = append(opened, u.String())
+		return true
+	}
+	c, _ := newTestComponentConfig(t, NopEditor(), cfg)
+	c.Resize(width, height)
+	_, isNew, err := c.OpenPrompt(browserapi.PromptConfig{
+		Message: "See the [advisory](" + link + ").", Options: []string{"OK"},
+	}, handler.NopPromptHandler())
+	require.NoError(t, err)
+	require.True(t, isNew)
+
+	w := term.NewStringWriter(width, height)
+	c.Draw(w)
+	require.NoError(t, w.Flush())
+	var pos term.Coordinates
+	found := false
+	for i, cell := range w.Cells() {
+		if cell.Ch == 'a' && i+1 < len(w.Cells()) && w.Cells()[i+1].Ch == 'd' {
+			pos, found = term.Coordinates{X: i % width, Y: i / width}, true
+			break
+		}
+	}
+	require.True(t, found, "link not drawn in:\n%s", w.String())
+
+	for _, key := range []term.Key{term.MouseLeft, term.MouseRelease} {
+		c.Handle(term.Event{Type: term.EventMouse, Key: key, MouseX: pos.X, MouseY: pos.Y})
+	}
+	assert.Equal(t, []string{link}, opened)
+}
+
+func TestComponentTabStatusRepaintsThroughEventPublisher(t *testing.T) {
+	interrupts := make(chan struct{}, 1)
+	cfg := text.DefaultConfig()
+	cfg.EventPublisher = func(ev term.Event) bool {
+		if ev.Type != term.EventInterrupt {
+			return true
+		}
+		select {
+		case interrupts <- struct{}{}:
+		default:
+		}
+		return true
+	}
+	c, _ := newTestComponentConfig(t, NopEditor(), cfg)
+	t.Cleanup(func() { _ = c.Close() })
+	uri, err := workspaceapi.ParseURI("rune-agent://model/chat")
+	require.NoError(t, err)
+	_, err = c.Tab(uri, 'E', "chat", browsertest.NewTestHandler())
+	require.NoError(t, err)
+	select {
+	case <-interrupts:
+	default:
+	}
+
+	require.NoError(t, c.SetTabStatus(uri, programstatus.Report{
+		State: programstatus.Working, Progress: -1,
+	}))
+	select {
+	case <-interrupts:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the working tab's spinner never asked the host to repaint")
+	}
 }
 
 func TestComponentCommandKeyBinding(t *testing.T) {

@@ -46,6 +46,7 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/term"
 	"github.com/unstablebuild/rune-go-sdk/tui"
 	"unstable.build/rune/internal/browser"
+	tcomponent "unstable.build/rune/internal/component"
 	"unstable.build/rune/internal/component/shader"
 	"unstable.build/rune/internal/debug"
 	"unstable.build/rune/internal/handler/command"
@@ -76,6 +77,10 @@ type IDE struct {
 	// soundRegistry resolves the names ideConfig.sounds plays. Only the
 	// IDE sets its entries, from the user config on every reload.
 	soundRegistry *sounds.Registry
+	// tutorialGraphics holds the images under the tutorials' buttons,
+	// which outlive any workspace's window manager and its images.
+	tutorialGraphics        *tcomponent.FrameGraphics
+	tutorialGraphicsStorage storageapi.Service
 }
 
 // EventPublisher is a function that publishes the given event back
@@ -219,6 +224,23 @@ func (i *IDE) Config() config.Config {
 	return config.MapConfig(i.ideConfig.cfg)
 }
 
+// LoadHUD reads the config file and the images its HUD names, dropping
+// their cached copies, for ApplyHUD to install. It fails when the config
+// does not load. It must not run on the event loop.
+func (i *IDE) LoadHUD(ctx context.Context) (*HUD, error) {
+	return i.workspaceHandler.loadHUD(ctx)
+}
+
+// ApplyHUD installs hud in every workspace, and in those still loading
+// once they open, so the next Draw shows it. A HUD whose load started
+// before that of the HUD installed last is ignored, which it reports with
+// applied false. Extensions fetch hud's config from then on, and their
+// running processes are told so; signalled is how many were, which redraw
+// only once they fetched it. It must run on the event loop.
+func (i *IDE) ApplyHUD(hud *HUD) (applied bool, signalled int) {
+	return i.workspaceHandler.applyHUD(hud)
+}
+
 // Sounds returns the player for the sounds defined in the `sounds`
 // section of the user config, the packages merged into it, and the
 // built-in sounds.
@@ -317,6 +339,13 @@ func (i *IDE) Browser() browser.Browser {
 // elements (e.g. floating prompts) that need to remain attached to
 // the focused workspace as the user switches between them.
 func (i *IDE) WindowManager() browserapi.WindowManager {
+	return currentWorkspaceWindowManager{root: i.workspaceHandler}
+}
+
+// Prompter returns a browserapi.Prompter that opens prompts in the
+// workspace in focus, in the IDE's theme. It must be called on the
+// event loop.
+func (i *IDE) Prompter() browserapi.Prompter {
 	return currentWorkspaceWindowManager{root: i.workspaceHandler}
 }
 
@@ -512,6 +541,16 @@ func (i *IDE) closeResources() (ret error) {
 
 	if err := i.tutorial.Close(); err != nil {
 		ret = multierr.Append(ret, err)
+	}
+
+	if i.tutorialGraphics != nil {
+		if err := i.tutorialGraphics.Close(); err != nil {
+			ret = multierr.Append(ret, err)
+		}
+		if err := i.tutorialGraphicsStorage.Close(); err != nil {
+			ret = multierr.Append(ret, err)
+		}
+		i.tutorialGraphics, i.tutorialGraphicsStorage = nil, nil
 	}
 
 	return

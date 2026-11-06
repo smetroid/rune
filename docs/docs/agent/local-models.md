@@ -353,6 +353,110 @@ models:
   it warm, and stops it once it goes idle; tune that with `idle_timeout`
   and `max_servers` (see [Configuration](#configuration)).
 
+## Workspace search
+
+Rune indexes the code of every workspace you open, so you can describe
+the code you are looking for instead of guessing the words it uses.
+Search from the command prompt with
+[`searchsemantic`](../learn/search.md#search-by-meaning), which floats the
+results in a picker with a preview of why each matched:
+
+```
+searchsemantic where is the retry backoff computed
+```
+
+or from the [Rune console](../learn/console.md) with `search`:
+
+```
+search where is the retry backoff computed
+```
+
+Results are ranked by both meaning and words, best first, each opening at
+the most relevant line. Results that trail far behind the best ones are
+listed under *Weaker matches*. A query shaped like an identifier, such as
+`search CodeLookup.definition`, jumps to where that symbol is
+defined.
+
+Semantic indexing is off by default. Set `search.semantic_enabled` to
+`true` (`True` in Starlark) and restart Rune to enable it.
+Regexp indexing (`search.regex_enabled`) and symbol indexing
+(`workspace.symboldb`) are independent of this opt-in.
+
+Once enabled, keyword search works as soon as the workspace is scanned.
+Searching by meaning needs the [local model server](#what-you-need) and a small
+embedding model. The first `searchsemantic` offers to set both up for
+you, and to upgrade the local model server when the installed version
+is too old to run the model; or download the model yourself, once:
+
+```
+models local download ggml-org/embeddinggemma-2-GGUF:Q8_0
+```
+
+Until it is downloaded, `search` answers by words alone and a
+notification reminds you of the command. Once it is, Rune encodes the
+workspace in the background and meaning search turns on by itself. The
+embedding model runs in its own server, so searching never unloads the
+chat model you are using, and it stops after a couple of idle minutes.
+
+**What is indexed**: source files, a repository's docs and settings
+(Markdown, YAML, TOML and the like) and Jupyter notebooks, cell by cell.
+Rune leaves out what git ignores, hidden folders, dependencies and build
+output (`node_modules`, `vendor`, `build`, `dist`, `target`, ...),
+generated and minified files, data files, license files, keys and
+credential files, and files too large to have been written by hand.
+Saving a file re-indexes just that file.
+
+Two more commands manage the index:
+
+```
+search status    # files by state, vectors, and what was left out
+search reindex   # rebuild the index from scratch
+```
+
+Scripts and tools can run the same search from a Rune terminal with
+[`runectl search semantic`](../develop/runectl.md):
+
+```
+runectl search semantic --limit 5 where is the retry backoff computed
+```
+
+Search is configured under `search`. The independent `regex_enabled` and
+`semantic_enabled` settings replace the old `enabled` switch:
+
+```yaml tab
+search:
+  # Off, `searchregex` reads every file instead of using its index.
+  regex_enabled: true
+  # Opt in to the semantic index for `search` and `searchsemantic`.
+  semantic_enabled: false
+  # The local embedding model that encodes code and queries.
+  model: "huggingface.co/ggml-org/embeddinggemma-2-GGUF:Q8_0"
+  # Characters a stretch of indexed code holds at most (whole lines).
+  code_stretch: 1800
+  # Workspace-relative folders never read, besides what git ignores.
+  excluded_folders: []
+  # File extensions never read, e.g. ["sql", "csv"].
+  excluded_extensions: []
+  # How long the embedding model stays loaded after the last search.
+  # Empty uses the default (2m).
+  idle_timeout: ""
+```
+
+```python tab
+"search": {
+    "regex_enabled": True,
+    "semantic_enabled": False,
+    "model": "huggingface.co/ggml-org/embeddinggemma-2-GGUF:Q8_0",
+    "code_stretch": 1800,
+    "excluded_folders": [],
+    "excluded_extensions": [],
+    "idle_timeout": "",
+},
+```
+
+The `search` [model alias](./intro.md#model-aliases) picks the model
+queries are encoded with. Leave it unset to use `search.model`.
+
 ## Choosing a model
 
 Some starting points that run well locally:

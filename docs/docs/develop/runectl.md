@@ -45,6 +45,7 @@ for a specific one. The main groups:
 | `runectl open <uri>` | Open a resource in the workspace. |
 | `runectl uri <path>` | Resolve a filesystem path to a workspace URI. |
 | `runectl datadir` | Print the extension data directory. |
+| `runectl screenshot` | Take a GUI screenshot and print its absolute path. |
 | `runectl exec -- <cmd> [args...]` | Run a command through the workspace executor. |
 | `runectl editor ...` | Read and edit buffer text, cursors, and location lists. |
 | `runectl wm ...` | Window-manager actions: focus, split, float, close. |
@@ -52,6 +53,7 @@ for a specific one. The main groups:
 | `runectl syntax ...` | Tree-sitter searches and structural queries across the workspace. |
 | `runectl storage ...` | Create, read, update, and delete extension documents. |
 | `runectl llm ...` | Talk to the workspace's model router. |
+| `runectl search ...` | Search the workspace's files through its indexes, by regular expression or by meaning. |
 | `runectl mcp` | Start an MCP server over stdio exposing Rune's syntax and LSP tools. |
 | `runectl status <state> [message]` | Report program status to the terminal (OSC 7501): `idle`, `working`, `done`, `blocked`, `error`, or `clear`. |
 | `runectl status wrap -- <cmd> [args...]` | Run any command and report its progress and outcome to the terminal, with no changes to the command. |
@@ -59,6 +61,66 @@ for a specific one. The main groups:
 Most commands accept a `-F`/`--format` flag to choose the output format:
 `table` (the default, human-readable), `json` (for piping into other
 tools), or a Go template for custom shaping.
+
+## Screenshots
+
+```sh
+image=$(runectl screenshot)
+```
+
+`runectl screenshot` saves Rune's rendered GUI to a PNG in
+`$RUNE_DATADIR/screenshots/` and prints only its absolute path, followed by
+a newline. It waits up to five seconds for a new complete image. Errors go
+to stderr with a nonzero exit status and no path on stdout.
+
+Before the capture, Rune reads its config file again and applies these
+keys to every open workspace, as `themereload` does:
+
+- `browser.window_manager`: `frame_attr`, `focus_frame_attr`,
+  `frame_charset`, `focus_frame_charset`, `scroll_bar_attr`,
+  `scroll_bar_charset`, `scroll_bar_char`, `scroll_bar_hover_char`,
+  `window_bar`, `window_bar_charset`, `close_icon` and `close_icon_attr`;
+- `browser.frameunion_charset`;
+- `browser.prompt`: `text_attr`, `highlight_attr`, `hover_attr`,
+  `clicked_attr`, `background_attr` and `images`;
+- `command.frame_charset`, `command.separator_charset` and
+  `command.show_manual`;
+- `editor.status_bar`: `layout`, `background_attr` and
+  `foreground_error_attr`;
+- `gui`: `quick_menu`, `quick_menu_sounds`, `themes`, `default_theme` and
+  `sound_volume`;
+- `notifications`: `attr`, `background_attr`, `frame_charset`, `padding`,
+  `progress_bar` and `progress_format`;
+- `program_status.sounds`;
+- `terminal.bell`;
+- `workspace`: `wallpaper_image`, `wallpaper_image_ascii`,
+  `wallpaper_ascii`, `wallpaper`, `wallpaper_attr`,
+  `wallpaper_background_attr` and `wallpaper_density_characters`;
+- `sounds`.
+
+It also reads again every image these keys name, even a file overwritten
+at the same path, so you can edit an image and see it in the next
+screenshot. Config errors show up as notifications in the capture. If the
+config file does not parse, none of its keys are applied.
+`gui.default_theme` and `gui.sound_volume` apply only when they differ
+from the values Rune read last, so a theme or volume picked since then
+stays. Prompts already open keep their style until reopened. Other keys
+still take `workspacereload` or a restart. Notifications already open take
+the new style at once.
+
+Rune also serves the new config to its extensions and, on macOS and
+Linux, sends each running extension process `SIGUSR2`. When it signalled
+any, it waits 300 ms before capturing so they can redraw; see [Reloading
+configuration](sdk/go.md#reloading-configuration). Rune Agent uses this to
+apply `extensions.rune-agent.config.status_bar` and
+`extensions.rune-agent.config.input_box_frame_charset` to its open chats.
+An extension slower than that shows its change in the next screenshot.
+
+Screenshots require GUI mode. TUI sessions safely discard the request, and
+`runectl` times out without creating an image. The capture contains Rune's
+output, not native window borders or the desktop behind it. Requests sharing
+a data directory should run sequentially: simultaneous requests can observe
+the same new file.
 
 ## Program status
 
@@ -195,6 +257,53 @@ review back in your terminal:
 ```
 runectl llm message gemini/gemini-3.5-flash "Review this Go file for bugs and edge cases: $(runectl editor print ./convert.go)"
 ```
+
+**Grep the workspace without walking it.** `search regexp` answers from
+the index Rune keeps of the workspace, so it returns as fast in a large
+monorepo as in a small project. It prints each line as `grep -n` does,
+and takes ripgrep's flags for case (`-i`), literal text (`-Q`), file
+globs (`-g`), and matches per file (`-m`):
+
+```
+runectl search regexp -g '*.go' -m 1 'func \w+Retry'
+```
+
+Hidden, ignored, and excluded folders are skipped unless `--root` names
+them or a folder that holds them, as in ripgrep:
+
+```
+runectl search regexp -r .github runs-on
+```
+
+**Find code by what it does.** `search semantic` takes every argument as the
+query, so it needs no quoting, and ranks the workspace's files by meaning
+as well as words. Each result prints like a grep match, `path:line:`,
+followed by its score, how far it stands out by meaning (z), and the line
+it opens at:
+
+```
+runectl search semantic --root internal --limit 5 where is the retry backoff computed
+```
+
+```
+internal/retry/backoff.go:42:   3.14  2.50  func parseRetryBackoff(spec string) (time.Duration, error) {
+internal/retry/policy.go:18:    1.20  0.00  first, factor, _ := parseRetryBackoff(p.Spec)
+```
+
+While the workspace is still being indexed, or when the query could only
+be ranked by words, `runectl` says why on stderr, such as
+`runectl: 1204 files left to index`, and stdout keeps only the results.
+
+A Go template shapes the output. `{{.Text}}` is the line as written, so
+this prints exactly what `grep -n` would. Run from Rune's command prompt,
+it lists the results in the `searchtext` finder, ready to filter and open:
+
+```
+searchtext runectl search semantic -F '{{.Path}}:{{.Line}}:{{.Text}}' retry backoff
+```
+
+`--meaning=false` ranks by words alone, and `--prefix-last` also matches
+the last word as a prefix, for search-as-you-type front ends.
 
 **Turn diagnostics into a commit gate.** Count workspace errors and fail
 a pre-commit hook if any remain:

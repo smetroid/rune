@@ -454,6 +454,94 @@ func TestFileExplorerOpenFile(t *testing.T) {
 	t.Fatalf("expected alpha.go to be opened in a tab")
 }
 
+func TestFileExplorerPreservesWindowSize(t *testing.T) {
+	actions := []struct {
+		name string
+		act  func(t *testing.T, b testEx)
+	}{
+		{"navigate", func(t *testing.T, b testEx) {
+			for i, key := range "jk" {
+				_, handled := b.Handle(term.Event{Type: term.EventKey, Ch: key})
+				require.True(t, handled)
+				require.Equal(t, 1-i, b.fileExplorerHandler.ed.CursorAtScroll().Y)
+			}
+		}},
+		{"open file", func(t *testing.T, b testEx) {
+			_, handled := b.Handle(term.Event{Type: term.EventKey, Key: term.KeyEnter})
+			require.True(t, handled)
+			uri, err := workspaceapi.ParseURI("memory:///alpha.go")
+			require.NoError(t, err)
+			_, opened := b.comp.Resource(uri)
+			require.True(t, opened)
+		}},
+		{"click file", func(t *testing.T, b testEx) {
+			for _, key := range []term.Key{term.MouseLeft, term.MouseRelease} {
+				_, handled := b.fileExplorerHandler.Handle(term.Event{Type: term.EventMouse, Key: key})
+				require.True(t, handled)
+			}
+			uri, err := workspaceapi.ParseURI("memory:///alpha.go")
+			require.NoError(t, err)
+			_, opened := b.comp.Resource(uri)
+			require.True(t, opened)
+		}},
+		{"refresh", func(t *testing.T, b testEx) {
+			b.fileExplorerHandler.refreshTree()
+		}},
+	}
+	for _, resize := range []struct {
+		dimension string
+		direction string
+	}{
+		{"width", "decrease"},
+		{"width", "increase"},
+		{"height", "decrease"},
+		{"height", "increase"},
+	} {
+		for _, action := range actions {
+			t.Run(resize.direction+" "+resize.dimension+"/"+action.name, func(t *testing.T) {
+				uri, err := workspaceapi.ParseURI("memory:///")
+				require.NoError(t, err)
+				scheme, err := workspace.NewMemoryScheme(context.Background(), config.NopConfig(), uri)
+				require.NoError(t, err)
+				touchTestFile(t, scheme, "alpha.go")
+				touchTestFile(t, scheme, "beta.go")
+
+				ed := vi.Editor(vi.WithWorkspaceCommandRegistry(uri, texttest.NopWorkspaceRegistry()))
+				b := newExForTestingWithWorkspace(t, workspace.NewSchemeWorkspace(uri, scheme, inlineSchedule),
+					ed, vte.DefaultConfig(), nopPublishEvent, clipboard.NewInMemory())
+				defer b.Close()
+				b.Resize(100, 30)
+				require.NoError(t, b.fexplorer(context.Background()))
+				win := b.fileExplorerWin
+				if resize.dimension == "height" {
+					require.NoError(t, b.dispatchCommand("windowsplit", "down"))
+					_, err = b.comp.SetFocus(win)
+					require.NoError(t, err)
+				}
+				b.Draw(term.NewStringWriter(100, 30))
+				initialSize := term.Coordinates{X: win.Width(), Y: win.Height()}
+
+				require.NoError(t, b.windowresize(context.Background(), resize.direction, resize.dimension))
+				b.Draw(term.NewStringWriter(100, 30))
+				resized := term.Coordinates{X: win.Width(), Y: win.Height()}
+				require.NotEqual(t, initialSize, resized)
+
+				action.act(t, b)
+				b.Draw(term.NewStringWriter(100, 30))
+				require.Equal(t, resized, term.Coordinates{X: win.Width(), Y: win.Height()})
+
+				require.NoError(t, b.windowresize(context.Background(), "reset"))
+				b.Draw(term.NewStringWriter(100, 30))
+				require.Equal(t, initialSize, term.Coordinates{X: win.Width(), Y: win.Height()})
+
+				sendExplorerKeys(t, b.fileExplorerHandler, "A"+strings.Repeat("x", initialSize.X)+"<esc>")
+				b.Draw(term.NewStringWriter(100, 30))
+				require.Greater(t, win.Width(), initialSize.X, "editing a longer name must still resize the window")
+			})
+		}
+	}
+}
+
 func TestFileExplorerToggleTwice(t *testing.T) {
 	uri, err := workspaceapi.ParseURI("memory:///")
 	require.NoError(t, err)
@@ -1367,7 +1455,7 @@ func TestHomeFallbackPromptDoesNotInstall(t *testing.T) {
 		"agent", "?",
 		"chateffort", "chatmaxtokens", "chatskill", "chatmodel",
 		"chatclear", "chatcompact", "chatfork", "chatexport", "chatlog",
-		"searchfile", "searchtext", "searchast",
+		"searchfile", "searchtext", "searchast", "searchsemantic", "searchregex",
 	}
 	for _, command := range commands {
 		t.Run(command, func(t *testing.T) {
@@ -4305,12 +4393,11 @@ func TestFloatingPromptClosePrefersFloatingFocus(t *testing.T) {
 		"fourth prompt",
 		"fifth prompt",
 	} {
-		prompts = append(prompts, browserComp.Prompt(
-			message,
-			[]string{yesOpt, noOpt},
-			yesNoKeyCombs,
-			handler.NopPromptHandler(),
-		))
+		prompts = append(prompts, browserComp.Prompt(browserapi.PromptConfig{
+			Message:  message,
+			Options:  []string{yesOpt, noOpt},
+			Bindings: yesNoKeyCombs,
+		}, handler.NopPromptHandler()))
 	}
 
 	require.Equal(t, len(prompts), browserComp.FloatingWindows())
@@ -4363,8 +4450,11 @@ func TestWindowCloseAllClosesFloatingWindows(t *testing.T) {
 	require.NoError(t, b.ex.windownew(t.Context()))
 	require.Equal(t, 2, browserComp.Tiles())
 
-	prompt := browserComp.Prompt("keep me?", []string{yesOpt, noOpt},
-		yesNoKeyCombs, handler.NopPromptHandler())
+	prompt := browserComp.Prompt(browserapi.PromptConfig{
+		Message:  "keep me?",
+		Options:  []string{yesOpt, noOpt},
+		Bindings: yesNoKeyCombs,
+	}, handler.NopPromptHandler())
 	require.Equal(t, 1, browserComp.FloatingWindows())
 
 	focus, err := b.ex.Browser().Focus()
@@ -4518,6 +4608,86 @@ func TestCommandPromptUsesSharedStoragePartition(t *testing.T) {
 	assert.Equal(t, int32(0), store.partitionCloseCount.Load())
 }
 
+func TestExRestyle(t *testing.T) {
+	// Nothing is on disk at uri, so only a reloaded image can draw.
+	const uri = "file:///nonexistent/hud/frame.png"
+	const notificationURI = "file:///nonexistent/hud/notification.png"
+	wmCfg := thandler.DefaultWindowManagerConfig()
+	wmCfg.FrameGraphicsStorage = storagestub.NewInMemoryService()
+	wmCfg.Interrupter = term.NopInterrupter()
+	b := newExForTesting(t, texttest.NopEditor(), text.WithWindowManagerConfig(wmCfg))
+	t.Cleanup(func() { _ = b.Close() })
+	unlock := b.lock()
+	defer unlock()
+	b.ex.frameGraphics()
+
+	cfg := ideConfig{cfg: map[string]any{
+		"browser": map[string]any{"window_manager": map[string]any{
+			"frame_charset": map[string]any{
+				"topleft": "╭", "graphics": map[string]any{"topleft": uri},
+			},
+		}},
+		"command": map[string]any{
+			"frame_charset":     map[string]any{"topright": "╮"},
+			"separator_charset": map[string]any{"left": "├"},
+		},
+		"editor": map[string]any{"status_bar": map[string]any{
+			"layout": "[{{ .Status }}]",
+		}},
+		"notifications": map[string]any{
+			"frame_charset": map[string]any{
+				"topleft":  "╓",
+				"graphics": map[string]any{"topleft": notificationURI, "mode": "overlay"},
+			},
+		},
+	}, errors: map[string]error{}}
+	style := cfg.hudStyle()
+	require.Empty(t, cfg.errors)
+	b.ex.statusBars = text.NewStatusBarStyles(text.StatusBarStyle{})
+
+	b.ex.restyle(style, map[string]image.Image{
+		uri:             image.NewRGBA(image.Rect(0, 0, 1, 1)),
+		notificationURI: image.NewRGBA(image.Rect(0, 0, 1, 1)),
+	}, nil)
+
+	assert.Equal(t, '╭', b.ex.config.FrameCharSet.TopLeft)
+	assert.Equal(t, style.commandPromptFrame, b.ex.commandPromptCfg.frameCharSet)
+	assert.Equal(t, '├', b.ex.commandPromptCfg.separator.Left)
+	assert.Equal(t, style.statusBar, b.ex.statusBars.Current())
+	frame, _ := b.ex.promptFrameCharSets()
+	assert.Equal(t, '╮', frame.TopRight)
+	for name, g := range map[string]*tcomponent.FrameGraphics{
+		"browser":        b.ex.comp.Browser().FrameGraphics(),
+		"command":        b.ex.cmdV.C.FrameGraphics(),
+		"command prompt": b.ex.graphics,
+	} {
+		require.NotNil(t, g, name)
+		img := g.Image(uri)
+		require.NotNil(t, img, name)
+		img.Resize(1, 1)
+		w := newCoveringImageWriter(1, 1)
+		img.Draw(w)
+		assert.Len(t, w.images, 1, "%s draws the reloaded image at once", name)
+	}
+
+	const width, height = 40, 10
+	b.Resize(width, height)
+	b.ex.container.Notify(notifications.LevelInfo, "hi")
+	w := newCoveringImageWriter(width, height)
+	b.ex.container.Draw(w)
+	require.NoError(t, w.Flush())
+	var corner []term.Coordinates
+	for y, row := range strings.Split(w.String(), "\n") {
+		for x, ch := range []rune(row) {
+			if ch == '╓' {
+				corner = append(corner, term.Coordinates{X: x, Y: y})
+			}
+		}
+	}
+	require.Len(t, corner, 1, "the notification draws with the restyled frame")
+	assert.True(t, w.images[corner[0]], "the notification draws the reloaded image over its corner")
+}
+
 func TestCommandPromptHasNoWindowBar(t *testing.T) {
 	b := newExForTesting(t, texttest.NopEditor(), text.WithCommandKey(testCommandKey))
 	defer b.Close()
@@ -4537,6 +4707,62 @@ func TestCommandPromptHasNoWindowBar(t *testing.T) {
 	assert.Contains(t, out, "─",
 		"the prompt keeps the configured frame charset")
 	require.NoError(t, b.ex.cmdWin.Close())
+}
+
+func TestPromptFrameCharSets(t *testing.T) {
+	prompt := component.FrameCharSet{
+		TopLeft: '╔', TopRight: '╗', BottomLeft: '╚', BottomRight: '╝',
+		HorizontalTop: '═', HorizontalBottom: '═',
+		VerticalLeft: '║', VerticalRight: '║',
+	}
+	suite := []struct {
+		description  string
+		frameCharSet *component.FrameCharSet
+		// wantPrompt reports whether the prompt draws the prompt charset.
+		wantPrompt bool
+	}{
+		{
+			description: "unset draws the window charset and shades the focused one",
+		},
+		{
+			description:  "set draws and shades the prompt charset",
+			frameCharSet: &prompt,
+			wantPrompt:   true,
+		},
+	}
+
+	for _, test := range suite {
+		t.Run(test.description, func(t *testing.T) {
+			b := newExForTesting(t, texttest.NopEditor(), text.WithCommandKey(testCommandKey))
+			defer b.Close()
+			b.Resize(40, 20)
+			b.ex.config.FocusFrameCharSet = component.FrameCharSetHighlight()
+			b.ex.commandPromptCfg.frameCharSet = test.frameCharSet
+
+			wantFrame, wantRadar := b.ex.config.FrameCharSet, b.ex.config.FocusFrameCharSet
+			if test.wantPrompt {
+				wantFrame, wantRadar = prompt, prompt
+			}
+			frame, radar := b.ex.promptFrameCharSets()
+			assert.Equal(t, wantFrame, frame)
+			assert.Equal(t, wantRadar, radar)
+
+			b.ex.openCommandPrompt()
+			require.NotNil(t, b.ex.cmd)
+			w := term.NewStringWriter(40, 20)
+			b.Draw(w)
+			require.NoError(t, w.Flush())
+			out := w.String()
+			for _, r := range []rune{prompt.TopLeft, prompt.TopRight, prompt.BottomLeft, prompt.BottomRight} {
+				if test.wantPrompt {
+					assert.Contains(t, out, string(r))
+				} else {
+					assert.NotContains(t, out, string(r))
+				}
+			}
+			require.NoError(t, b.ex.cmdWin.Close())
+		})
+	}
 }
 
 func TestCommandPromptShaderGating(t *testing.T) {
@@ -5857,13 +6083,21 @@ func TestExUsesSharedIDEStorage(t *testing.T) {
 	require.Equal(t, 1, storage.partitionCalls)
 	terminals := storage.partitions[idehistory.TerminalStatePartition]
 	require.NotNil(t, terminals)
+	// So do the command prompt's frame images.
+	ex.frameGraphics()
+	ex.frameGraphics()
+	require.Equal(t, 2, storage.partitionCalls)
+	frameImages := storage.partitions[frameImagesPartition]
+	require.NotNil(t, frameImages)
 
 	require.NoError(t, ex.Close())
 	require.Equal(t, 0, storage.closeCalls)
 	require.Equal(t, 1, terminals.closeCalls)
+	require.Equal(t, 1, frameImages.closeCalls)
 	require.NoError(t, ex.Close())
 	require.Equal(t, 0, storage.closeCalls)
 	require.Equal(t, 1, terminals.closeCalls)
+	require.Equal(t, 1, frameImages.closeCalls)
 }
 
 func TestFullScreen(t *testing.T) {
@@ -9979,7 +10213,7 @@ func TestOpenMarkdownFloatingScrollBar(t *testing.T) {
 			// The default bar is a bold border, which a string frame
 			// cannot tell apart from the border itself.
 			wmCfg := thandler.DefaultWindowManagerConfig()
-			wmCfg.ScrollBarChar = '#'
+			wmCfg.ScrollBarCharSet = component.ScrollBarCharSet{Middle: '#'}
 			b := newExForTesting(t, texttest.NopEditor(), text.WithWindowManagerConfig(wmCfg))
 			require.NoError(t, b.ex.openMarkdownFloating(tc.md, "Doc", 16))
 			assert.Equal(t, tc.want, gitshowFrame(t, b, 30, 12))

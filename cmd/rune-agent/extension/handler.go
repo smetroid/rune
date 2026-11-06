@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	stdimage "image"
 	"io"
 	"log/slog"
 	"maps"
@@ -49,6 +50,7 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/api/config"
 	"github.com/unstablebuild/rune-go-sdk/api/extensionapi"
 	"github.com/unstablebuild/rune-go-sdk/api/llmapi"
+	"github.com/unstablebuild/rune-go-sdk/api/searchapi"
 	"github.com/unstablebuild/rune-go-sdk/api/semanticapi"
 	"github.com/unstablebuild/rune-go-sdk/api/storageapi"
 	"github.com/unstablebuild/rune-go-sdk/api/syntaxapi"
@@ -69,7 +71,9 @@ import (
 
 	runemcp "unstable.build/rune/cmd/rune-agent/mcp"
 	"unstable.build/rune/cmd/rune-agent/memory"
+	"unstable.build/rune/internal/component/imageuri"
 	"unstable.build/rune/internal/component/markdown"
+	"unstable.build/rune/internal/component/template"
 	"unstable.build/rune/internal/debug"
 	"unstable.build/rune/internal/extension/extutil"
 	"unstable.build/rune/internal/ide/vctrl"
@@ -263,12 +267,16 @@ var (
 	}
 )
 
-func registerOpenAITools(registry *agent.Registry, fs workspaceapi.FileSystem, cwd workspaceapi.URI, tracker *agentools.FileTracker, sessions *agentools.SessionManager, cfg configedit.Config) {
+func registerOpenAITools(
+	registry *agent.Registry, fs workspaceapi.FileSystem, cwd workspaceapi.URI,
+	searcher searchapi.Searcher, tracker *agentools.FileTracker,
+	sessions *agentools.SessionManager, cfg configedit.Config,
+) {
 	for _, provider := range []string{"openai", "codex"} {
 		registry.RegisterOverrides(provider,
 			agentools.NewListDir(fs, cwd),
 			agentools.NewWriteStdin(sessions),
-			agentools.NewGrepFiles(fs, cwd, tracker),
+			agentools.NewGrepFiles(fs, cwd, tracker, searcher),
 		)
 		registry.RegisterReplacement(provider, "bash",
 			agentools.NewExecCommand(sessions, cwd, cfg))
@@ -344,8 +352,9 @@ func newCommandEventHandler(
 	}
 
 	lsp := w.LSP(ctx)
+	searcher := w.Search(ctx)
 	cfg := configedit.NewConfig(fs, cwd, pconfig)
-	tools, tracker := agentools.DefaultTools(fs, executor, cwd, lsp, toolsCfg, cfg)
+	tools, tracker := agentools.DefaultTools(fs, executor, cwd, lsp, searcher, toolsCfg, cfg)
 
 	parser := w.Parser(ctx)
 	tools = append(tools, agentools.LSPTools(lsp, fs, parser, cwd, tracker)...)
@@ -388,7 +397,7 @@ func newCommandEventHandler(
 	ret.toolRegistry = agent.NewRegistry(tools...)
 	ret.executor = executor
 	ret.sessionMgr = agentools.NewSessionManager(ret.ctx, executor, terminal)
-	registerOpenAITools(ret.toolRegistry, fs, cwd, tracker, ret.sessionMgr, cfg)
+	registerOpenAITools(ret.toolRegistry, fs, cwd, searcher, tracker, ret.sessionMgr, cfg)
 	geminitools.Register(ret.toolRegistry)
 	ret.systemPrompt = agent.DefaultSystemPrompt(cwd)
 	ret.attribution = agent.DefaultAttribution()
@@ -425,6 +434,11 @@ func newCommandEventHandler(
 		slog.Warn("web_browser tool unavailable", "error", err)
 	} else {
 		ret.browserDir = dir
+	}
+	if dir, err := imageGenDir(ctx, w); err != nil {
+		slog.Warn("imagegen tool unavailable", "error", err)
+	} else {
+		ret.imagesDir = dir
 	}
 	ret.memoryPath = memoryPath
 	ret.cwd = cwd
@@ -540,6 +554,7 @@ func newCommandEventHandler(
 		ret.cfg.SendMessageStringConfig.Attributes = sendMsgAttr
 	}
 	ret.cfg.PinnedMessageMaxRows = resolvePinnedUserMsgMaxLines(pconfig)
+	ret.cfg.MessagesRowConfig.PadHorizontal = resolveTranscriptHorizontalPadding(pconfig)
 	ret.cfg.SendMessageIcon = resolveUserMsgIcon(ret.cfg.SendMessageIcon, pconfig)
 	recvMsgAttr, err := config.GetAttributes(pconfig, "assistant_msg_attr")
 	if err != nil {
@@ -579,15 +594,7 @@ func newCommandEventHandler(
 		ret.cfg.InputBox.FrameAttr = inputBoxFrameAttr
 	}
 
-	inputBoxFrameCharset, err := tconfig.GetFrameCharset(
-		pconfig, "input_box_frame_charset", ret.cfg.InputBox.FrameCharSet)
-	if err != nil {
-		if err != config.ErrNotFound {
-			slog.Warn("get 'input_box_frame_charset' from extension config", "error", err)
-		}
-	} else {
-		ret.cfg.InputBox.FrameCharSet = inputBoxFrameCharset
-	}
+	ret.cfg.InputBox.FrameCharSet = inputBoxFrameCharSet(pconfig)
 
 	inputBgColor, err := pconfig.GetColor("input_background_color")
 	if err != nil {
@@ -649,7 +656,7 @@ func newCommandEventHandler(
 		slog.Warn("resolve dialogue editor, using inputbox", "error", cerr)
 	} else {
 		ret.cfg.Editor = editor
-		if modal, merr := extutil.EditorModal(w.Config(ctx)); merr != nil {
+		if modal, merr := extutil.EditorModal(hostConfig); merr != nil {
 			slog.Warn("resolve dialogue editor mode", "error", merr)
 		} else {
 			ret.cfg.EditorModal = modal
@@ -664,6 +671,8 @@ func newCommandEventHandler(
 
 	ret.db = db
 	ret.cfg.StatusBar.Storage = storageapi.WithPartition(db, statusBarImagesPartition)
+	ret.cfg.InputBox.GraphicsStorage = storageapi.WithPartition(db, frameImagesPartition)
+	ret.imageCache = storageapi.WithPartition(db, transcriptImagesPartition)
 	if auditEnabled, _ := pconfig.GetBool("audit_enabled"); auditEnabled {
 		ret.auditStore = audit.NewStore(ret.db)
 	}
@@ -741,12 +750,14 @@ func newCommandEventHandler(
 }
 
 // newLinkClickHandler shows http, https and file links through o, resolving
-// scheme-less file paths against cwd. Fragment-only links, network references
-// and other schemes are left to the dialogue.
+// scheme-less file paths against cwd. A file link to a source location then
+// moves the cursor of the editor ed returns for it. Fragment-only links,
+// network references and other schemes are left to the dialogue.
 func newLinkClickHandler(
 	mu sync.Locker,
 	cwd workspaceapi.URI,
 	o browserapi.ResourceOpener,
+	ed cursorEditor,
 	noti browserapi.Notifications,
 ) func(*url.URL) bool {
 	return func(link *url.URL) bool {
@@ -760,47 +771,199 @@ func newLinkClickHandler(
 			return false
 		}
 		// The dialogue calls this holding mu, which its stream consumer needs
-		// too, and Show and Notify wait on the host's lock. Relock in a defer
-		// so a panic still hands mu back to the dialogue's deferred Unlock.
+		// too, and the opener, editor and Notify wait on the host's lock.
+		// Relock in a defer so a panic still hands mu back to the dialogue's
+		// deferred Unlock.
 		mu.Unlock()
 		defer mu.Lock()
-		uri, err := dialogueLinkURI(cwd, link)
-		if err == nil {
-			err = o.Show(uri)
-		}
-		if err != nil {
+		if err := showDialogueLink(cwd, link, o, ed); err != nil {
 			_, _ = noti.Notify(browserapi.LevelError, "open %s: %v", link, err)
 		}
 		return true
 	}
 }
 
-func dialogueLinkURI(cwd workspaceapi.URI, link *url.URL) (workspaceapi.URI, error) {
+func showDialogueLink(
+	cwd workspaceapi.URI, link *url.URL, o browserapi.ResourceOpener, ed cursorEditor,
+) error {
+	uri, pos, err := dialogueLinkURI(cwd, link)
+	if err != nil {
+		return err
+	}
+	if err := o.Show(uri); err != nil {
+		return err
+	}
+	if pos == nil {
+		return nil
+	}
+	// Show also succeeds for resources it routes to another workspace,
+	// whose editors ed cannot reach, so a failed lookup is reported as
+	// the navigation failing rather than the file failing to open.
+	eh, err := ed.Editor(uri)
+	if err == nil {
+		err = ed.SetCursor(eh, *pos)
+	}
+	if err != nil {
+		return fmt.Errorf("go to %d:%d: %w", pos.Y+1, pos.X+1, err)
+	}
+	return nil
+}
+
+// dialogueLinkURI resolves link against the workspace directory cwd. When
+// the last path segment of a file or scheme-less link ends in :line or
+// :line:column, the location is removed from the URI and returned as
+// zero-based coordinates, which are nil for links without one. Only
+// unescaped colons delimit a location, so %3A keeps a colon in the file name.
+func dialogueLinkURI(
+	cwd workspaceapi.URI, link *url.URL,
+) (workspaceapi.URI, *term.Coordinates, error) {
+	var pos *term.Coordinates
+	if link.Scheme == "" || link.Scheme == "file" {
+		escaped, loc, err := splitSourceLocation(link.EscapedPath())
+		if err != nil {
+			return workspaceapi.URI{}, nil, err
+		}
+		if loc != nil {
+			stripped := *link
+			if stripped.Path, err = url.PathUnescape(escaped); err != nil {
+				return workspaceapi.URI{}, nil, err
+			}
+			stripped.RawPath = escaped
+			link, pos = &stripped, loc
+		}
+	}
 	if link.Scheme == "" {
 		base, err := url.Parse(cwd.String())
 		if err != nil {
-			return workspaceapi.URI{}, err
+			return workspaceapi.URI{}, nil, err
 		}
 		// The workspace URI denotes a directory even without a trailing slash.
 		base.Path = strings.TrimSuffix(base.Path, "/") + "/"
 		base.RawPath = ""
 		link = base.ResolveReference(link)
 	}
-	return workspaceapi.ParseURI(link.String())
+	uri, err := workspaceapi.ParseURI(link.String())
+	return uri, pos, err
+}
+
+// splitSourceLocation splits a one-based :line or :line:column suffix off
+// the last segment of the escaped path p. A colon followed by anything but
+// a decimal number is part of the file name. A number that cannot be a
+// position, such as zero, a signed number or one overflowing int32, is an
+// error rather than a file name, so the link never opens a file named after
+// part of its location.
+func splitSourceLocation(p string) (string, *term.Coordinates, error) {
+	dir, file := path.Split(p)
+	fields := strings.Split(file, ":")
+	n := len(fields)
+	if n < 2 || !isLocationField(fields[n-1]) {
+		return p, nil, nil
+	}
+	loc := fields[n-1:]
+	if n > 2 && isLocationField(fields[n-2]) {
+		loc = fields[n-2:]
+	}
+	name := strings.Join(fields[:n-len(loc)], ":")
+	suffix := ":" + strings.Join(loc, ":")
+	if name == "" {
+		return "", nil, fmt.Errorf("source location %q names no file", suffix)
+	}
+	lineCol := [2]int{1, 1}
+	for i, f := range loc {
+		v, err := strconv.ParseInt(f, 10, 32)
+		if err != nil || v < 1 || f[0] < '0' || f[0] > '9' {
+			return "", nil, fmt.Errorf("invalid source location %q", suffix)
+		}
+		lineCol[i] = int(v)
+	}
+	return dir + name, &term.Coordinates{X: lineCol[1] - 1, Y: lineCol[0] - 1}, nil
+}
+
+// isLocationField reports whether f is written as a decimal number, signed
+// or not, whether or not it is a valid position.
+func isLocationField(f string) bool {
+	if f != "" && (f[0] == '+' || f[0] == '-') {
+		f = f[1:]
+	}
+	return f != "" && strings.Trim(f, "0123456789") == ""
+}
+
+const transcriptImagesPartition = "transcript-images"
+
+// frameImagesPartition caches the images of the compose box frame.
+const frameImagesPartition = "frame_images"
+
+// inputBoxFrameCharSet reads input_box_frame_charset from pconfig, whose
+// missing slots keep those of the default frame. An invalid charset is
+// the default one.
+func inputBoxFrameCharSet(pconfig config.Config) component.FrameCharSet {
+	def := defaultComponentCfg.InputBox.FrameCharSet
+	if def == (component.FrameCharSet{}) {
+		def = component.FrameCharSetDefault()
+	}
+	cs, err := tconfig.GetFrameCharset(pconfig, "input_box_frame_charset", def)
+	if err != nil && !errors.Is(err, config.ErrNotFound) {
+		slog.Warn("get 'input_box_frame_charset' from extension config", "error", err)
+	}
+	return cs
+}
+
+// refreshFrameImages reads the images g names again, dropping the copies
+// storage caches, and returns them by URI. An image that does not load
+// is left out.
+func refreshFrameImages(
+	ctx context.Context, g component.FrameCharSetGraphics, storage storageapi.Service,
+) map[string]stdimage.Image {
+	images := make(map[string]stdimage.Image)
+	tried := make(map[string]struct{})
+	for _, uri := range []string{
+		g.TopLeft, g.TopRight, g.BottomLeft, g.BottomRight,
+		g.HorizontalTop, g.HorizontalBottom, g.VerticalLeft, g.VerticalRight,
+	} {
+		if _, ok := tried[uri]; ok || uri == "" {
+			continue
+		}
+		tried[uri] = struct{}{}
+		img, err := imageuri.Refresh(ctx, uri, template.DefaultImageTTL, storage)
+		if err != nil {
+			slog.Warn("reload frame image", "error", err)
+			continue
+		}
+		images[uri] = img
+	}
+	return images
 }
 
 // dialogueConfig returns the config for a dialogue whose handler is given
 // mu, which the dialogue holds while it calls OnLinkClick.
 func (h *aiEditorHandler) dialogueConfig(mu sync.Locker) dialoguetui.ComponentConfig {
+	h.statusBarMu.Lock()
 	cfg := h.cfg
-	cfg.OnLinkClick = newLinkClickHandler(mu, h.cwd, h.o, h.n)
+	h.statusBarMu.Unlock()
+	cfg.OnLinkClick = newLinkClickHandler(mu, h.cwd, h.o, h.ed, h.n)
+	md := dialoguetui.DefaultMarkdownConfig()
+	if cfg.MarkdownConfig != nil {
+		shared := *cfg.MarkdownConfig
+		md = &shared
+	}
+	md.FS = h.fs
+	md.Dir = h.cwd.Path()
+	// Markdown rejects an interrupter without storage, so set them together.
+	if h.imageCache != nil {
+		md.Storage = h.imageCache
+		md.Interrupter = h.p
+	}
+	cfg.MarkdownConfig = md
 	return cfg
 }
 
 type aiEditorHandler struct {
-	exit                atomic.Uint32
-	llmSvc              llmapi.Service
-	defaultModel        string
+	exit         atomic.Uint32
+	llmSvc       llmapi.Service
+	defaultModel string
+	// statusBarMu guards cfg.StatusBar and cfg.InputBox.FrameCharSet,
+	// which a config reload replaces.
+	statusBarMu         sync.Mutex
 	cfg                 dialoguetui.ComponentConfig
 	backgroundAttr      term.Attributes
 	dialogueStore       dialoguemanager.Store
@@ -831,10 +994,12 @@ type aiEditorHandler struct {
 	o              browserapi.ResourceOpener
 	p              term.Interrupter
 	db             storageapi.Service
+	imageCache     storageapi.Service
 	config         configedit.Config
 	skillRegistry  *skills.SkillRegistry
 	plansDir       string
 	browserDir     string
+	imagesDir      string
 	memoryDataPath string
 	exec           workspaceapi.Executor
 	lsp            semanticapi.LSP
@@ -1038,6 +1203,64 @@ func (h *aiEditorHandler) setDefaultMaxTokens(n int) {
 		}
 		return true
 	})
+}
+
+// watchReload reloads the style of the chats from the config fetch
+// returns each time reload delivers, until ctx ends. A nil reload never
+// delivers.
+func (h *aiEditorHandler) watchReload(
+	ctx context.Context, reload <-chan os.Signal, fetch func(context.Context) config.Config,
+) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-reload:
+		}
+		if err := h.reloadStyle(ctx, fetch(ctx)); err != nil {
+			slog.Warn("reload the chat style", "error", err)
+		}
+	}
+}
+
+// reloadStyle configures the status bar and the compose box frame of the
+// open chats, and of those opened from now on, with the status_bar block
+// and input_box_frame_charset host holds for this extension, reading
+// their images again. host is the config Rune serves; a host that could
+// not be fetched leaves the chats as they are.
+func (h *aiEditorHandler) reloadStyle(ctx context.Context, host config.Config) error {
+	own, err := ownConfig(host)
+	if err != nil {
+		return err
+	}
+	h.statusBarMu.Lock()
+	storage := h.cfg.StatusBar.Storage
+	frameStorage := h.cfg.InputBox.GraphicsStorage
+	h.statusBarMu.Unlock()
+	cfg := statusBarConfig(own, host, h.n)
+	cfg.DurationPrecision = h.cfg.DurationPrecision
+	cfg.Storage = storage
+	cfg.Images = refreshStatusBarImages(ctx, cfg.Layout, storage)
+	frame := inputBoxFrameCharSet(own)
+	var frameImages map[string]stdimage.Image
+	if frameStorage != nil {
+		frameImages = refreshFrameImages(ctx, frame.Graphics, frameStorage)
+	}
+
+	h.statusBarMu.Lock()
+	h.cfg.StatusBar = cfg
+	h.cfg.InputBox.FrameCharSet = frame
+	h.statusBarMu.Unlock()
+	h.openChats.Range(func(_, v any) bool {
+		// Chats still opening hold no component yet; they read the
+		// config they open with afterwards.
+		if sc, ok := v.(syncComponent); ok {
+			sc.setStatusBarConfig(cfg)
+			sc.setInputBoxFrameCharSet(frame, frameImages)
+		}
+		return true
+	})
+	return h.p.Interrupt(ctx)
 }
 
 func (h *aiEditorHandler) Handle(ctx context.Context, ev textapi.Event) (exit bool) {
@@ -1551,6 +1774,10 @@ func (h *aiEditorHandler) newChat(
 	}
 	chatRegistry := agent.NewRegistry(allTools...)
 	chatRegistry.AddOverrides(h.toolRegistry.Overrides())
+	adapter.modelToolsFn = func(svc llmapi.Service, model llmapi.ModelEntry) {
+		h.registerImageGen(chatRegistry, svc, model)
+	}
+	adapter.modelToolsFn(backendService, chatEntry)
 	chatRegistry.RegisterOverrides("openai",
 		agentools.NewUpdatePlan(progressUpdater),
 		agentools.NewRequestUserInput(prompter),
@@ -1619,7 +1846,9 @@ func (h *aiEditorHandler) newChat(
 
 	bhandler := browserapi.FuncHandler(handler, func() error {
 		cancel()
+		mu.Lock()
 		_ = comp.Close()
+		mu.Unlock()
 		if webBrowser != nil {
 			webBrowser.Close()
 		}
@@ -1672,6 +1901,28 @@ func (h *aiEditorHandler) webBrowser(dialogueID string) *agentools.WebBrowser {
 	return agentools.NewWebBrowser(h.executor, h.fs, bin, h.browserDir, dialogueID)
 }
 
+func (h *aiEditorHandler) registerImageGen(registry *agent.Registry, svc llmapi.Service, model llmapi.ModelEntry) {
+	registry.RegisterExclusions(model.Provider, "imagegen")
+	if tool := h.imageGen(svc, model); tool != nil {
+		registry.RegisterOverrides(model.Provider, tool)
+	}
+}
+
+func (h *aiEditorHandler) imageGen(svc llmapi.Service, model llmapi.ModelEntry) *agentools.ImageGen {
+	if svc == nil || h.imagesDir == "" || h.fs == nil {
+		return nil
+	}
+	available, err := svc.CanGenerateImages(h.ctx, model)
+	if err != nil {
+		slog.Debug("imagegen tool unavailable", "error", err)
+		return nil
+	}
+	if !available {
+		return nil
+	}
+	return agentools.NewImageGen(svc, model, h.fs, h.imagesDir)
+}
+
 // installRoot resolves paths under the data directory of the workspace
 // host, which the IDE resolves for extensions (extensionapi.Workspace).
 type installRoot interface {
@@ -1688,6 +1939,14 @@ func webBrowserDir(ctx context.Context, root installRoot) (string, error) {
 		return "", fmt.Errorf("resolve the data directory on the workspace host: %w", err)
 	}
 	return path.Join(dataDir, "agent-browser"), nil
+}
+
+func imageGenDir(ctx context.Context, root installRoot) (string, error) {
+	dataDir, err := root.FindInstalledResource(ctx, ".")
+	if err != nil {
+		return "", fmt.Errorf("resolve the data directory on the workspace host: %w", err)
+	}
+	return path.Join(dataDir, "generated_images"), nil
 }
 
 func getModelUri(id, model string) (workspaceapi.URI, error) {
@@ -1770,7 +2029,9 @@ func (h *aiEditorHandler) handleQuery(cmd textapi.Command) error {
 
 	bhandler := browserapi.FuncHandler(handler, func() error {
 		cancel()
-		return nil
+		mu.Lock()
+		defer mu.Unlock()
+		return comp.Close()
 	})
 	floating := browserapi.FuncFloating(bhandler, func() (int, int) {
 		mu.Lock()
@@ -2054,18 +2315,26 @@ func addMessage(c *dialoguetui.Component, msg llmapi.Message, pendingTools map[s
 			}
 		}
 	case llmapi.RoleUser:
+		attachments := replayedAttachments(msg)
+		// Tool images are carried in synthetic user messages for providers
+		// that cannot accept images in tool results. They are not user turns.
+		if msg.Content == "" && len(attachments) == 0 && slices.ContainsFunc(msg.MultiContent, func(part llmapi.ContentPart) bool {
+			return part.Type == llmapi.ContentPartTypeImageURL
+		}) {
+			return
+		}
 		if replayed, ok := parseStoredCommandMessage(msg.Content); ok {
 			c.AddSendMessage(replayed)
 		} else if strings.HasPrefix(msg.Content, agent.CompactSummaryPrefix) ||
 			strings.HasPrefix(msg.Content, "Plan approved. Saved to ") {
 			c.AddSendMessageMarkdown(msg.Content)
 		} else {
-			c.AddSendMessageAttachments(msg.Content, replayedAttachments(msg))
+			c.AddSendMessageAttachments(msg.Content, attachments)
 		}
 	case llmapi.RoleSystem:
 	case llmapi.RoleTool:
 		id := msg.ToolCallID
-		name := "tool"
+		name := cmp.Or(msg.Name, "tool")
 		args := ""
 		if pendingTools != nil {
 			if call, ok := pendingTools[id]; ok {
@@ -2098,9 +2367,30 @@ func addMessage(c *dialoguetui.Component, msg llmapi.Message, pendingTools map[s
 				return
 			}
 		}
-		c.AddToolCall(id, name, args, "")
-		c.CompleteToolCall(id, name, args, "", msg.Content, false)
+		summary := ""
+		if name == "imagegen" {
+			var parsed struct {
+				Prompt string `json:"prompt"`
+			}
+			if json.Unmarshal([]byte(args), &parsed) == nil {
+				summary = parsed.Prompt
+			}
+		}
+		c.AddToolCall(id, name, args, summary)
+		c.CompleteToolCall(id, name, args, summary, msg.Content, false)
+		for _, image := range toolResultImages(name, msg.Content, false) {
+			c.AddToolCallImage(id, image, summary)
+		}
 	}
+}
+
+func toolResultImages(name, output string, isError bool) []string {
+	if name == "imagegen" && !isError {
+		if image, ok := agentools.GeneratedImagePath(output); ok {
+			return []string{image}
+		}
+	}
+	return nil
 }
 
 func firstModel(svc llmapi.Service) string {
@@ -2328,6 +2618,7 @@ func createAgentCompletions(
 							IsError:          cev.Event.IsError,
 							ToolDuration:     cev.Event.ToolDuration,
 							ParentToolCallID: cev.ParentToolCallID,
+							ImagePaths:       toolResultImages(cev.Event.ToolName, cev.Event.ToolOutput, cev.Event.IsError),
 						}
 					case agent.EventToolsDropped:
 						msg = dialoguetui.MessageEvent{
@@ -2421,10 +2712,6 @@ func createAgentCompletions(
 		var it iterator.Iterator[agent.Event]
 		if req.skillName != "" {
 			if skill, ok := skillRegistry.Get(req.skillName); ok && skill.Type == "agent" {
-				var allowedTools []string
-				if skill.AllowedTools != "" {
-					allowedTools = strings.Fields(skill.AllowedTools)
-				}
 				var initialMessages []llmapi.Message
 				if skill.ParentContext {
 					initialMessages = parentDialogueContextMessages(
@@ -2438,7 +2725,7 @@ func createAgentCompletions(
 					DisplayMessage:    req.displayText,
 					Attachments:       req.attachments,
 					AdditionalContext: upsRes.AdditionalContext,
-					AllowedTools:      allowedTools,
+					Tools:             skillRegistry.AgentPolicy(skill),
 					SystemPrompt:      skill.Body,
 					InitialMessages:   initialMessages,
 				})
@@ -2584,6 +2871,7 @@ func createAgentCompletions(
 						ToolOutput:   ev.ToolOutput,
 						IsError:      ev.IsError,
 						ToolDuration: ev.ToolDuration,
+						ImagePaths:   toolResultImages(ev.ToolName, ev.ToolOutput, ev.IsError),
 					}:
 					case <-ctx.Done():
 						return
@@ -2779,6 +3067,21 @@ func resolvePinnedUserMsgMaxLines(pconfig config.Config) int {
 		return defaultPinnedUserMsgMaxLines
 	}
 	return max(0, v)
+}
+
+// resolveTranscriptHorizontalPadding reads transcript_horizontal_padding,
+// the columns left beside the transcript, split evenly on either side. A
+// negative value is the transcript's width instead, and the transcript
+// fills a tab narrower than that. Zero fills the tab.
+func resolveTranscriptHorizontalPadding(pconfig config.Config) int {
+	v, err := pconfig.GetInt("transcript_horizontal_padding")
+	if err != nil {
+		if !errors.Is(err, config.ErrNotFound) {
+			slog.Warn("get 'transcript_horizontal_padding' from config", "error", err)
+		}
+		return defaultComponentCfg.MessagesRowConfig.PadHorizontal
+	}
+	return v
 }
 
 // resolveUserMsgIcon reads user_msg_icon, the character marking each of

@@ -198,12 +198,43 @@ func (m *workspaceRunner) StartCommand(ctx context.Context, cmd workspaceapi.Cmd
 		return 0, err
 	}
 	cmd.Env = append(cmd.Env, env...)
+	pid := ""
+	if m.workspace.Scheme() == workspace.FileScheme {
+		pid = fmt.Sprint(os.Getpid())
+	}
+	// PIDs are host-local; clear caller or inherited values on remote hosts.
+	cmd.Env = append(cmd.Env, "RUNE_PID="+pid)
 	return m.executor.StartCommand(ctx, cmd)
 }
 
 // Signal sends a signal to the running process.
 func (m *workspaceRunner) Signal(pid workspaceapi.Pid, sig syscall.Signal) error {
 	return m.executor.Signal(pid, sig)
+}
+
+// SignalReload implements extension.Runner. Extensions run through
+// extExecutor, not the workspace's executor Signal uses.
+func (m *workspaceRunner) SignalReload() int {
+	if reloadSignal == 0 {
+		return 0
+	}
+	m.mu.Lock()
+	pids := make([]workspaceapi.Pid, 0, len(m.states))
+	for _, state := range m.states {
+		if state.running && state.pid != 0 {
+			pids = append(pids, state.pid)
+		}
+	}
+	m.mu.Unlock()
+	signalled := 0
+	for _, pid := range pids {
+		if err := m.extExecutor.Signal(pid, reloadSignal); err != nil {
+			m.log(log.DebugLevel, "signal extension pid %d to reload its config: %v", pid, err)
+			continue
+		}
+		signalled++
+	}
+	return signalled
 }
 
 // LookPath returns the path of the file StartCommand runs for name in dir.
@@ -399,6 +430,7 @@ func (m *workspaceRunner) makeCommand(
 	if err != nil {
 		return workspaceapi.Cmd{}, nil, err
 	}
+	ret.Env = append(ret.Env, fmt.Sprintf("RUNE_PID=%d", os.Getpid()))
 	stdin, releaseStdin, stdout, err := m.makeProtocolExchange(state, verifiedPublisher)
 	if err != nil {
 		return workspaceapi.Cmd{}, nil, err

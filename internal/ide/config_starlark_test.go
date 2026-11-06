@@ -39,6 +39,7 @@ import (
 	"unstable.build/rune/internal/handler"
 	"unstable.build/rune/internal/ide/idepreset"
 	"unstable.build/rune/internal/ide/idestatus"
+	"unstable.build/rune/internal/llm/llmsearch"
 	"unstable.build/rune/internal/sounds"
 	"unstable.build/rune/internal/workspace"
 )
@@ -434,6 +435,40 @@ func assertStandardSearchMap(t *testing.T, search map[string]any, bg string) {
 	assert.Equal(t, map[string]any{"fg": "default", "bg": "blue"}, search["button_hover_attr"])
 }
 
+func TestRuneStarSeparatorInheritsFrame(t *testing.T) {
+	data := readRuneStar(t)
+	for _, tc := range []struct {
+		name        string
+		tui         bool
+		left, right rune
+	}{
+		{"GUI", false, '\U0001fb7c', '\U0001fb7f'},
+		{"TUI", true, '├', '┤'},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := decodeDefaultConfig(DefaultConfig{src: string(data), modal: true, tui: tc.tui})
+			require.NoError(t, err)
+			cfg := ideConfig{cfg: raw, errors: map[string]error{}}
+			got := cfg.commandPromptCfg().separator
+			assert.Equal(t, tc.left, got.Left)
+			assert.Equal(t, tc.right, got.Right)
+			assert.Equal(t, cfg.windowFrameCharset().HorizontalBottom, got.HorizontalLeft)
+			assert.Equal(t, got.HorizontalLeft, got.HorizontalRight)
+
+			raw, err = decodeOverlayConfigFile(strings.NewReader(`config["command"]["frame_charset"] = {
+    "horizontalbottom": "=", "graphics": {"horizontalbottom": "file:///custom.png"},
+}`), "config.star", raw)
+			require.NoError(t, err)
+			cfg.cfg = raw
+			got = cfg.commandPromptCfg().separator
+			assert.Equal(t, '=', got.HorizontalLeft)
+			assert.Equal(t, '=', got.HorizontalRight)
+			assert.Equal(t, "file:///custom.png", got.Graphics.Horizontal)
+			assert.Empty(t, cfg.errors)
+		})
+	}
+}
+
 func TestRuneStarAsDefaultConfig(t *testing.T) {
 	data := readRuneStar(t)
 
@@ -543,6 +578,25 @@ func TestRuneStarModelsConfig(t *testing.T) {
 	} {
 		assert.Containsf(t, sampling, key, "models.local.sampling.%s missing", key)
 	}
+}
+
+func TestRuneStarSearchConfig(t *testing.T) {
+	cfg, err := decodeStarlarkConfig(starlarkConfigSource{
+		src:      readRuneStar(t),
+		filename: "rune.star",
+		params:   map[string]any{"mode": "modal", "tui": false},
+	})
+	require.NoError(t, err)
+	_, nested := cfg["models"].(map[string]any)["search"]
+	assert.False(t, nested, "search is a top-level block, not models.search")
+
+	c := ideConfig{cfg: cfg, errors: map[string]error{}}
+	got := c.searchConfig()
+	assert.Empty(t, got.Options.ExcludedFolders)
+	assert.Empty(t, got.Options.ExcludedExtensions)
+	got.Options.ExcludedFolders, got.Options.ExcludedExtensions = nil, nil
+	assert.Equal(t, llmsearch.DefaultConfig(), got)
+	assert.Empty(t, c.errors)
 }
 
 func TestDecodeStarlarkOverlayRead(t *testing.T) {
@@ -670,9 +724,10 @@ func TestLoadWorkspaceConfigStar(t *testing.T) {
 	ws := workspace.NewSchemeWorkspace(uri, scheme, inlineSchedule)
 	defer ws.Close()
 
-	isConfigErr, err := loadWorkspaceConfig("config.star", ws, c, trustAllWorkspaceConfigs)
+	applied, isConfigErr, err := loadWorkspaceConfig("config.star", ws, c, trustAllWorkspaceConfigs)
 	require.NoError(t, err)
 	assert.False(t, isConfigErr)
+	assert.Equal(t, `config["log_level"] = "debug"`, string(applied))
 	assert.Equal(t, "debug", c.cfg["log_level"])
 }
 
@@ -705,7 +760,7 @@ config["extensions"]["git"]["config"]["nested"]["override"] = "star"
 	ws := workspace.NewSchemeWorkspace(uri, scheme, inlineSchedule)
 	defer ws.Close()
 
-	isConfigErr, err := loadWorkspaceConfig("config.star", ws, c, trustAllWorkspaceConfigs)
+	_, isConfigErr, err := loadWorkspaceConfig("config.star", ws, c, trustAllWorkspaceConfigs)
 	require.NoError(t, err)
 	assert.False(t, isConfigErr)
 
@@ -789,9 +844,10 @@ func TestLoadWorkspaceConfigYAML(t *testing.T) {
 	ws := workspace.NewSchemeWorkspace(uri, scheme, inlineSchedule)
 	defer ws.Close()
 
-	isConfigErr, err := loadWorkspaceConfig("config.yaml", ws, c, trustAllWorkspaceConfigs)
+	applied, isConfigErr, err := loadWorkspaceConfig("config.yaml", ws, c, trustAllWorkspaceConfigs)
 	require.NoError(t, err)
 	assert.False(t, isConfigErr)
+	assert.Equal(t, "log_level: warn\n", string(applied))
 	assert.Equal(t, "warn", c.cfg["log_level"])
 }
 
@@ -894,7 +950,7 @@ editor:
 
 			var offered []byte
 			called := false
-			_, err := loadWorkspaceConfig("config.yaml", newTestFileWorkspace(t, dir), &c,
+			applied, _, err := loadWorkspaceConfig("config.yaml", newTestFileWorkspace(t, dir), &c,
 				func(contents []byte) (bool, error) {
 					called = true
 					offered = contents
@@ -912,9 +968,11 @@ editor:
 					"the trust decision must cover exactly the bytes that are applied")
 			}
 			if !tt.wantApplied {
+				assert.Nil(t, applied)
 				assert.Equal(t, before, c.cfg)
 				return
 			}
+			assert.Equal(t, tt.contents, string(applied))
 			assert.Equal(t, 2, c.editorTabspaces())
 			assert.True(t, c.cfg["authorizer"].(map[string]any)["auto_authorize_commands"].(bool))
 			assert.True(t, c.updatesAutoInstall())
@@ -1037,7 +1095,7 @@ config["editor"]["modal"]["message_bar"] = {"attr": {"fg": "white", "bg": "navy"
 		require.NoError(t, err)
 		w := workspace.NewSchemeWorkspace(uri, scheme, inlineSchedule)
 		t.Cleanup(func() { w.Close() })
-		_, err = loadWorkspaceConfig(ws.name, w, &cfg, trustAllWorkspaceConfigs)
+		_, _, err = loadWorkspaceConfig(ws.name, w, &cfg, trustAllWorkspaceConfigs)
 		require.NoError(t, err)
 		return cfg
 	}

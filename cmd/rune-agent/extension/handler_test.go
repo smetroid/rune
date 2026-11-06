@@ -17,14 +17,20 @@
 package extension
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	stdimage "image"
+	"image/color"
+	"image/png"
 	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,12 +45,15 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/api/config"
 	"github.com/unstablebuild/rune-go-sdk/api/llmapi"
 	"github.com/unstablebuild/rune-go-sdk/api/semanticapi"
+	"github.com/unstablebuild/rune-go-sdk/api/storageapi"
+	"github.com/unstablebuild/rune-go-sdk/api/storageapi/storagestub"
 	"github.com/unstablebuild/rune-go-sdk/api/textapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
 	"github.com/unstablebuild/rune-go-sdk/handler/handlertest"
 	"github.com/unstablebuild/rune-go-sdk/handler/repl"
 	"github.com/unstablebuild/rune-go-sdk/iterator"
 	"github.com/unstablebuild/rune-go-sdk/term"
+	"github.com/unstablebuild/rune-go-sdk/tui"
 
 	"unstable.build/rune/cmd/rune-agent/agent"
 	"unstable.build/rune/cmd/rune-agent/agent/agentools"
@@ -55,8 +64,396 @@ import (
 	"unstable.build/rune/cmd/rune-agent/llm/llmarg"
 	"unstable.build/rune/cmd/rune-agent/llm/llmtest"
 	runemcp "unstable.build/rune/cmd/rune-agent/mcp"
+	"unstable.build/rune/internal/browser/browsertest"
+	"unstable.build/rune/internal/component/asciiart"
+	"unstable.build/rune/internal/component/markdown"
 	"unstable.build/rune/internal/debug"
 )
+
+func TestAddMessageHiddenToolImages(t *testing.T) {
+	image := llmapi.ContentPart{Type: llmapi.ContentPartTypeImageURL, ImageURL: "data:image/png;base64,aW1hZ2U="}
+	for _, tt := range []struct {
+		name   string
+		msg    llmapi.Message
+		hidden bool
+	}{
+		{"tool image", llmapi.Message{Role: llmapi.RoleUser, MultiContent: []llmapi.ContentPart{image}}, true},
+		{"tool hint and image", llmapi.Message{Role: llmapi.RoleUser, MultiContent: []llmapi.ContentPart{
+			{Type: llmapi.ContentPartTypeText, Text: "Generated image saved to /tmp/image.png"}, image,
+		}}, true},
+		{"user text and image", llmapi.Message{Role: llmapi.RoleUser, Content: "edit this", MultiContent: []llmapi.ContentPart{image}}, false},
+		{"image attachment without text", llmapi.Message{Role: llmapi.RoleUser, MultiContent: []llmapi.ContentPart{
+			{Type: llmapi.ContentPartTypeText},
+			{Type: llmapi.ContentPartTypeText, Text: "Attached image /tmp/reference.png:"}, image,
+		}}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			comp := dialoguetui.NewComponent(defaultComponentCfg)
+			t.Cleanup(func() { require.NoError(t, comp.Close()) })
+			addMessage(comp, llmapi.Message{Role: llmapi.RoleUser, Content: "generate an image"}, nil)
+			before := comp.Height(80)
+			addMessage(comp, tt.msg, nil)
+			if tt.hidden {
+				assert.Equal(t, before, comp.Height(80), "tool images must not add empty sent bubbles")
+			} else {
+				assert.Greater(t, comp.Height(80), before, "real user messages and attachments must remain visible")
+			}
+		})
+	}
+}
+
+func TestAddMessageGeneratedImageReplay(t *testing.T) {
+	var data bytes.Buffer
+	require.NoError(t, png.Encode(&data, stdimage.NewRGBA(stdimage.Rect(0, 0, 2, 2))))
+	dir := t.TempDir()
+	svc := &imageGenerationService{image: llmapi.Image{PNG: data.Bytes()}}
+	tool := agentools.NewImageGen(svc, llmapi.ModelEntry{Provider: "codex"}, testLocalFS{root: dir}, dir)
+	ctx := agent.WithDialogueID(t.Context(), "chat")
+	ctx = agent.WithParentToolCallID(ctx, "call")
+	const args = `{"prompt":"a blue bird"}`
+	result := tool.Execute(ctx, args)
+	require.False(t, result.IsError, result.Content)
+	imagePath, ok := agentools.GeneratedImagePath(result.Content)
+	require.True(t, ok)
+
+	for _, collapsed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("collapsed=%v", collapsed), func(t *testing.T) {
+			cfg := defaultComponentCfg
+			cfg.StartCollapsed = collapsed
+			live := dialoguetui.NewComponent(cfg)
+			replayed := dialoguetui.NewComponent(cfg)
+			t.Cleanup(func() {
+				require.NoError(t, live.Close())
+				require.NoError(t, replayed.Close())
+			})
+			live.AddSendMessage("draw a bird")
+			live.AddToolCall("call", "imagegen", args, tool.Summary(args))
+			live.CompleteToolCall("call", "imagegen", args, tool.Summary(args), result.Content, false)
+			live.AddToolCallImage("call", imagePath, tool.Summary(args))
+			live.AddReceiveMessage("Done.")
+			pending := make(map[string]llmapi.ToolCall)
+			for _, msg := range []llmapi.Message{
+				{Role: llmapi.RoleUser, Content: "draw a bird"},
+				{Role: llmapi.RoleAssistant, ToolCalls: []llmapi.ToolCall{{ID: "call", Function: llmapi.FunctionCall{Name: "imagegen", Arguments: args}}}},
+				{Role: llmapi.RoleTool, ToolCallID: "call", Content: result.Content},
+				{Role: llmapi.RoleUser, MultiContent: result.MultiContent},
+				{Role: llmapi.RoleAssistant, Content: "Done."},
+			} {
+				addMessage(replayed, msg, pending)
+			}
+			require.Empty(t, pending)
+			assert.Equal(t, live.Height(80), replayed.Height(80))
+			draw := func(comp *dialoguetui.Component) string {
+				comp.Resize(80, 30)
+				writer := term.NewStringWriter(80, 30)
+				comp.Draw(writer)
+				require.NoError(t, writer.Flush())
+				return writer.String()
+			}
+			actual := draw(replayed)
+			assert.Equal(t, draw(live), actual)
+			wantCaptions := 2
+			if !collapsed {
+				wantCaptions++ // Expanded tools also show their arguments.
+			}
+			assert.Equal(t, wantCaptions, strings.Count(actual, "a blue bird"), "tool summary and image caption must both survive replay")
+		})
+	}
+	assert.Equal(t, []string{imagePath}, toolResultImages("imagegen", result.Content, false))
+	assert.Empty(t, toolResultImages("imagegen", result.Content, true))
+	assert.Empty(t, toolResultImages("read_file", result.Content, false))
+}
+
+func TestCreateAgentCompletionsChildImages(t *testing.T) {
+	var data bytes.Buffer
+	require.NoError(t, png.Encode(&data, stdimage.NewRGBA(stdimage.Rect(0, 0, 2, 2))))
+	dir := t.TempDir()
+	svc := &imageGenerationService{image: llmapi.Image{PNG: data.Bytes()}}
+	tool := agentools.NewImageGen(svc, llmapi.ModelEntry{Provider: "codex"}, testLocalFS{root: dir}, dir)
+	toolCtx := agent.WithParentToolCallID(agent.WithDialogueID(t.Context(), "child"), "call")
+	const args = `{"prompt":"a blue bird"}`
+	result := tool.Execute(toolCtx, args)
+	require.False(t, result.IsError, result.Content)
+	imagePath, ok := agentools.GeneratedImagePath(result.Content)
+	require.True(t, ok)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	tx := make(chan dialoguetui.MessageEvent)
+	childEvents := make(chan agent.ChildEvent)
+	done := make(chan struct{})
+	go debug.CapturePanicReport(func() {
+		defer close(done)
+		createAgentCompletions(ctx, cancel, tx, nil, nil, nil,
+			childEvents, nil, "parent", newStatusBarSyncComponent(), nil, newMemDialogueStore())
+	})
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	for _, tt := range []struct {
+		name      string
+		toolName  string
+		isError   bool
+		wantPaths []string
+	}{
+		{name: "generated image", toolName: "imagegen", wantPaths: []string{imagePath}},
+		{name: "failed generation", toolName: "imagegen", isError: true},
+		{name: "ordinary tool", toolName: "read_file"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			event := agent.ChildEvent{ParentToolCallID: "spawn", Event: agent.Event{
+				Type: agent.EventToolResult, ToolCallID: "call", ToolName: tt.toolName,
+				ToolArgs: args, ToolSummary: "a blue bird", ToolOutput: result.Content, IsError: tt.isError,
+			}}
+			select {
+			case childEvents <- event:
+			case <-time.After(3 * time.Second):
+				t.Fatal("child event was not consumed")
+			}
+			select {
+			case msg := <-tx:
+				assert.Equal(t, dialoguetui.MessageEventToolResult, msg.Type)
+				assert.Equal(t, "spawn", msg.ParentToolCallID)
+				assert.Equal(t, "call", msg.ToolCallID)
+				assert.Equal(t, "a blue bird", msg.ToolSummary)
+				assert.Equal(t, tt.wantPaths, msg.ImagePaths)
+			case <-time.After(3 * time.Second):
+				t.Fatal("child result was not forwarded")
+			}
+		})
+	}
+}
+
+type imageGenerationService struct {
+	llmapi.Service
+	available bool
+	err       error
+	checks    int
+	image     llmapi.Image
+	// images, when set, are returned one per request before falling back to image.
+	images []llmapi.Image
+
+	mu       sync.Mutex
+	requests []llmapi.ImageRequest
+}
+
+func (s *imageGenerationService) CanGenerateImages(context.Context, llmapi.ModelEntry) (bool, error) {
+	s.checks++
+	return s.available, s.err
+}
+
+func (s *imageGenerationService) GenerateImage(_ context.Context, _ llmapi.ModelEntry, request llmapi.ImageRequest) (llmapi.Image, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requests = append(s.requests, request)
+	if len(s.images) > 0 {
+		generated := s.images[0]
+		s.images = s.images[1:]
+		return generated, s.err
+	}
+	return s.image, s.err
+}
+
+func (s *imageGenerationService) imageRequests() []llmapi.ImageRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.requests)
+}
+
+func TestE2EImageGenEditsEarlierImagesFromTheSameRun(t *testing.T) {
+	solidPNG := func(c color.Color) []byte {
+		img := stdimage.NewRGBA(stdimage.Rect(0, 0, 2, 2))
+		for y := range 2 {
+			for x := range 2 {
+				img.Set(x, y, c)
+			}
+		}
+		var buf bytes.Buffer
+		require.NoError(t, png.Encode(&buf, img))
+		return buf.Bytes()
+	}
+	red := solidPNG(color.RGBA{R: 255, A: 255})
+	blue := solidPNG(color.RGBA{B: 255, A: 255})
+	combined := solidPNG(color.RGBA{R: 255, B: 255, A: 255})
+	imagegen := func(id, args string) llmtest.Response {
+		return llmtest.Response{ToolCalls: []llmapi.ToolCall{{
+			ID: id, Type: llmapi.ToolTypeFunction,
+			Function: llmapi.FunctionCall{Name: "imagegen", Arguments: args},
+		}}, FinishReason: llmapi.FinishReasonToolCall}
+	}
+	model := llmapi.ModelEntry{Provider: "test", Name: "test-model", ContextWindow: 128_000}
+	scripted := llmtest.New([]llmapi.ModelEntry{model},
+		imagegen("draw-red", `{"prompt":"a red square"}`),
+		imagegen("draw-blue", `{"prompt":"a blue square"}`),
+		imagegen("combine", `{"prompt":"put both squares side by side","num_last_images_to_include":2}`),
+		llmtest.Response{Chunks: []string{"done"}, FinishReason: llmapi.FinishReasonStop},
+	)
+	svc := &imageGenerationService{
+		Service: scripted, available: true,
+		images: []llmapi.Image{{PNG: red}, {PNG: blue}, {PNG: combined}},
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	dir := t.TempDir()
+	fs, cwd := testLocalFS{root: dir}, dirURI(dir)
+	h := &aiEditorHandler{
+		ctx:            ctx,
+		llmSvc:         svc,
+		defaultModel:   model.Name,
+		dialogueStore:  newMemDialogueStore(),
+		wm:             &recordingWindowManager{},
+		n:              stubNotifications{},
+		p:              term.NopInterrupter(),
+		config:         configedit.NopConfig(),
+		skillRegistry:  skills.NewRegistry(fs, cwd, nil, nil),
+		toolRegistry:   agent.NewRegistry(),
+		agentsConfig:   agent.NewConfig([]agent.Definition{{ID: "default", AllowAny: true}}),
+		cwd:            cwd,
+		fs:             fs,
+		memoryDataPath: t.TempDir(),
+		imagesDir:      filepath.Join(dir, "generated_images"),
+	}
+	c, err := h.newChat(textapi.Command{Args: []string{"painting-fox"}}, workspaceapi.URI{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.content.Close()) })
+
+	const width, height = 100, 60
+	c.content.Resize(width, height)
+	keys, err := term.ParseKeys("draw<enter>")
+	require.NoError(t, err)
+	for _, k := range keys {
+		c.content.Handle(term.Event{Type: term.EventKey, Mod: k.Mod, Key: k.Key, Ch: k.Ch})
+	}
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.Equal(c, 4, scripted.CallCount())
+	}, 5*time.Second, 10*time.Millisecond)
+
+	requests := svc.imageRequests()
+	require.Len(t, requests, 3)
+	assert.Empty(t, requests[0].Images)
+	assert.Empty(t, requests[1].Images)
+	assert.Equal(t, [][]byte{red, blue}, requests[2].Images,
+		"the edit must receive both images generated earlier in the run, oldest first")
+
+	var sent []string
+	for _, m := range scripted.Requests()[3].Request.Messages {
+		if m.Role != llmapi.RoleUser {
+			continue
+		}
+		for _, part := range m.MultiContent {
+			if part.Type == llmapi.ContentPartTypeImageURL {
+				sent = append(sent, part.ImageURL)
+			}
+		}
+	}
+	dataURI := func(data []byte) string {
+		return "data:image/png;base64," + base64.StdEncoding.EncodeToString(data)
+	}
+	assert.Equal(t, []string{dataURI(red), dataURI(blue), dataURI(combined)}, sent,
+		"the model must see every image generated in the run")
+}
+
+func TestHandlerImageGen(t *testing.T) {
+	for _, tt := range []struct {
+		name, provider, dir string
+		available           bool
+		err                 error
+		want                bool
+	}{
+		{name: "paid codex", provider: "codex", dir: "/host/generated_images", available: true, want: true},
+		{name: "no eligible login", provider: "codex", dir: "/host/generated_images"},
+		{name: "openai API key", provider: "openai", dir: "/host/generated_images", available: true, want: true},
+		{name: "future provider", provider: "future", dir: "/host/generated_images", available: true, want: true},
+		{name: "unsupported anthropic", provider: "anthropic", dir: "/host/generated_images"},
+		{name: "unsupported openai model", provider: "openai", dir: "/host/generated_images"},
+		{name: "no host directory", provider: "codex", available: true},
+		{name: "host error", provider: "codex", dir: "/host/generated_images", err: errors.New("offline")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := &imageGenerationService{available: tt.available, err: tt.err}
+			h := &aiEditorHandler{ctx: t.Context(), fs: nopFileSystem{}, imagesDir: tt.dir}
+			model := llmapi.ModelEntry{Provider: tt.provider, Name: "model"}
+			tool := h.imageGen(svc, model)
+			if tt.want {
+				require.NotNil(t, tool)
+				assert.Equal(t, "imagegen", tool.Definition().Function.Name)
+				svc.available = false
+				assert.Nil(t, h.imageGen(svc, model), "recheck eligibility for the next chat")
+				assert.Equal(t, 2, svc.checks)
+			} else {
+				assert.Nil(t, tool)
+			}
+			if tt.dir == "" {
+				assert.Zero(t, svc.checks)
+			}
+			assert.Nil(t, h.imageGen(llmtest.New(nil), model), "unsupported service")
+		})
+	}
+}
+
+func TestHandlerRegisterImageGen(t *testing.T) {
+	h := &aiEditorHandler{ctx: t.Context(), fs: nopFileSystem{}, imagesDir: "/host/generated_images"}
+	registry := agent.NewRegistry()
+	svc := &imageGenerationService{available: true}
+	for _, provider := range []string{"openai", "codex", "future"} {
+		model := llmapi.ModelEntry{Provider: provider, Name: "supported"}
+		h.registerImageGen(registry, svc, model)
+		_, ok := registry.Get("imagegen", provider)
+		require.True(t, ok)
+		_, ok = registry.Get("imagegen", "anthropic")
+		require.False(t, ok)
+		_, ok = registry.Get("imagegen", "")
+		require.False(t, ok)
+
+		svc.available = false
+		model.Name = "unsupported"
+		h.registerImageGen(registry, svc, model)
+		_, ok = registry.Get("imagegen", provider)
+		require.False(t, ok, "same-provider model switches must recheck eligibility")
+
+		svc.available = true
+		h.registerImageGen(registry, svc, model)
+		_, ok = registry.Get("imagegen", provider)
+		require.True(t, ok)
+	}
+}
+
+func TestImageGenDir(t *testing.T) {
+	for _, root := range []string{"/Users/u/.rune", "/home/dev/.runedev"} {
+		got, err := imageGenDir(t.Context(), fakeInstallRoot{root: root})
+		require.NoError(t, err)
+		assert.Equal(t, root+"/generated_images", got)
+	}
+	_, err := imageGenDir(t.Context(), fakeInstallRoot{err: os.ErrNotExist})
+	assert.ErrorContains(t, err, "data directory on the workspace host")
+}
+
+func TestDialogueConfigImages(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		cache storageapi.Service
+	}{
+		{name: "image cache", cache: storagestub.NewInMemoryService()},
+		{name: "no image cache"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &aiEditorHandler{
+				cfg: defaultComponentCfg, imageCache: tt.cache, p: term.NopInterrupter(),
+				fs: nopFileSystem{}, cwd: dirURI("/workspace"),
+			}
+			cfg := h.dialogueConfig(new(sync.Mutex))
+			require.NotSame(t, h.cfg.MarkdownConfig, cfg.MarkdownConfig)
+			assert.Equal(t, h.cwd.Path(), cfg.MarkdownConfig.Dir)
+			assert.Equal(t, h.fs, cfg.MarkdownConfig.FS)
+			assert.Equal(t, tt.cache, cfg.MarkdownConfig.Storage)
+			assert.Equal(t, tt.cache != nil, cfg.MarkdownConfig.Interrupter != nil)
+			_, err := markdown.NewWithConfig("**hello**", *cfg.MarkdownConfig)
+			assert.NoError(t, err, "transcript markdown must render")
+			assert.Nil(t, h.cfg.MarkdownConfig.Storage, "shared defaults must remain unchanged")
+		})
+	}
+}
 
 func TestQueryFloatingCloseLeavesItsWindow(t *testing.T) {
 	model := llmapi.ModelEntry{Provider: "test", Name: "test-model", ContextWindow: 128_000}
@@ -91,9 +488,9 @@ func TestProviderContentSearch(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "literal.txt"), []byte("other\nneedle configuration value\n"), 0o644))
 	fs := testLocalFS{root: dir}
 	cwd := dirURI(dir)
-	tools, tracker := agentools.DefaultTools(fs, testLocalExec{}, cwd, nil, agentools.Config{}, configedit.NopConfig())
+	tools, tracker := agentools.DefaultTools(fs, testLocalExec{}, cwd, nil, agentools.NoIndex(), agentools.Config{}, configedit.NopConfig())
 	registry := agent.NewRegistry(tools...)
-	registerOpenAITools(registry, fs, cwd, tracker, nil, configedit.NopConfig())
+	registerOpenAITools(registry, fs, cwd, agentools.NoIndex(), tracker, nil, configedit.NopConfig())
 	for _, provider := range []string{"openai", "codex", "anthropic"} {
 		t.Run(provider, func(t *testing.T) {
 			tool, ok := registry.Get("search_content", provider)
@@ -117,9 +514,9 @@ func TestProviderContentSearch(t *testing.T) {
 func TestRegisterOpenAIToolsKeepsCompact(t *testing.T) {
 	dir := t.TempDir()
 	fs, cwd := testLocalFS{root: dir}, dirURI(dir)
-	tools, tracker := agentools.DefaultTools(fs, testLocalExec{}, cwd, nil, agentools.Config{}, configedit.NopConfig())
+	tools, tracker := agentools.DefaultTools(fs, testLocalExec{}, cwd, nil, agentools.NoIndex(), agentools.Config{}, configedit.NopConfig())
 	registry := agent.NewRegistry(tools...)
-	registerOpenAITools(registry, fs, cwd, tracker, nil, configedit.NopConfig())
+	registerOpenAITools(registry, fs, cwd, agentools.NoIndex(), tracker, nil, configedit.NopConfig())
 	for _, provider := range []string{"openai", "codex", "anthropic"} {
 		t.Run(provider, func(t *testing.T) {
 			_, ok := registry.Get("compact", provider)
@@ -1531,9 +1928,9 @@ func TestChatRepeatedReadRequestsReturnToolErrors(t *testing.T) {
 			mu := new(sync.Mutex)
 			dhandler, tx, rx := dialoguetui.Handler(ctx, mu, comp, interrupter)
 			fs, cwd := testLocalFS{root: dir}, dirURI(dir)
-			tools, tracker := agentools.DefaultTools(fs, testLocalExec{}, cwd, nil, agentools.Config{}, configedit.NopConfig())
+			tools, tracker := agentools.DefaultTools(fs, testLocalExec{}, cwd, nil, agentools.NoIndex(), agentools.Config{}, configedit.NopConfig())
 			registry := agent.NewRegistry(tools...)
-			registerOpenAITools(registry, fs, cwd, tracker, nil, configedit.NopConfig())
+			registerOpenAITools(registry, fs, cwd, agentools.NoIndex(), tracker, nil, configedit.NopConfig())
 			skillReg := skills.NewRegistry(fs, cwd, nil, nil)
 			store := newMemDialogueStore()
 			ag := agent.NewAgent(svc, registry, skillReg, store, agent.NoMemory(), agent.Config{
@@ -1788,14 +2185,242 @@ func TestHandlerWebBrowser(t *testing.T) {
 }
 
 func TestExtensionDialogueLinkClick(t *testing.T) {
+	goTo := func(uri, pos string) []string {
+		return []string{"show " + uri, "editor " + uri, "cursor " + uri + " " + pos}
+	}
+	const configURI = "file:///workspace/project/config.go"
 	tests := []struct {
 		name        string
 		cwd         string
 		link        string
 		showErr     error
+		editorErr   error
+		cursorErr   error
+		clicks      int
 		wantHandled bool
 		wantCalls   []string
 	}{
+		{
+			name:        "source link opens the file at its line",
+			link:        "internal/config/config.go:99",
+			wantHandled: true,
+			wantCalls: []string{
+				"show file:///workspace/project/internal/config/config.go",
+				"editor file:///workspace/project/internal/config/config.go",
+				"cursor file:///workspace/project/internal/config/config.go {X:0 Y:98}",
+			},
+		},
+		{
+			name:        "dot-prefixed source link to the first line",
+			link:        "./config.go:1",
+			wantHandled: true,
+			wantCalls:   goTo(configURI, "{X:0 Y:0}"),
+		},
+		{
+			name:        "line and column",
+			link:        "./config.go:99:7",
+			wantHandled: true,
+			wantCalls:   goTo(configURI, "{X:6 Y:98}"),
+		},
+		{
+			name:        "largest line and column",
+			link:        "./config.go:2147483647:2147483647",
+			wantHandled: true,
+			wantCalls:   goTo(configURI, "{X:2147483646 Y:2147483646}"),
+		},
+		{
+			name:        "absolute source link",
+			link:        "/tmp/main.go:12:3",
+			wantHandled: true,
+			wantCalls:   goTo("file:///tmp/main.go", "{X:2 Y:11}"),
+		},
+		{
+			name:        "file URL source link",
+			link:        "file:///tmp/main.go:12",
+			wantHandled: true,
+			wantCalls:   goTo("file:///tmp/main.go", "{X:0 Y:11}"),
+		},
+		{
+			name:        "source link in ssh workspace",
+			cwd:         "ssh://alice@example.com:2222/work/project",
+			link:        "internal/config/config.go:99:7",
+			wantHandled: true,
+			wantCalls: goTo(
+				"ssh://alice@example.com:2222/work/project/internal/config/config.go",
+				"{X:6 Y:98}",
+			),
+		},
+		{
+			name:        "source link in rune workspace",
+			cwd:         "rune://server:7000/work/project",
+			link:        "docs/README.md:3",
+			wantHandled: true,
+			wantCalls:   goTo("rune://server:7000/work/project/docs/README.md", "{X:0 Y:2}"),
+		},
+		{
+			name:        "source link keeps escaping query and fragment",
+			cwd:         "file:///workspace/my%20project",
+			link:        "docs/a%20b%2525.go:4:2?view=raw#section",
+			wantHandled: true,
+			wantCalls: goTo(
+				"file:///workspace/my%20project/docs/a%20b%2525.go?view=raw#section",
+				"{X:1 Y:3}",
+			),
+		},
+		{
+			name:        "encoded colon is part of the file name",
+			link:        "docs/notes%3A99",
+			wantHandled: true,
+			wantCalls:   []string{"show file:///workspace/project/docs/notes%3A99"},
+		},
+		{
+			name:        "location after an encoded colon",
+			link:        "docs/notes%3A99:5",
+			wantHandled: true,
+			wantCalls:   goTo("file:///workspace/project/docs/notes%3A99", "{X:0 Y:4}"),
+		},
+		{
+			name:        "encoded colon does not delimit a column",
+			link:        "./main.go:10%3A5",
+			wantHandled: true,
+			wantCalls:   []string{"show file:///workspace/project/main.go:10%3A5"},
+		},
+		{
+			name:        "nonnumeric colon is part of the file name",
+			link:        "docs/a:b.md",
+			wantHandled: true,
+			wantCalls:   []string{"show file:///workspace/project/docs/a:b.md"},
+		},
+		{
+			name:        "location is only read from the last segment",
+			link:        "./docs:9/README.md",
+			wantHandled: true,
+			wantCalls:   []string{"show file:///workspace/project/docs:9/README.md"},
+		},
+		{
+			name:        "https port and colon-number path are untouched",
+			link:        "https://example.com:8443/src/main.go:99:7",
+			wantHandled: true,
+			wantCalls:   []string{"show https://example.com:8443/src/main.go:99:7"},
+		},
+		{
+			name:        "http colon-number path is untouched",
+			link:        "http://example.com:8080/main.go:99?a=1#L3",
+			wantHandled: true,
+			wantCalls:   []string{"show http://example.com:8080/main.go:99?a=1#L3"},
+		},
+		{
+			name:        "zero line is rejected",
+			link:        "./config.go:0",
+			wantHandled: true,
+			wantCalls:   []string{`open ./config.go:0: invalid source location ":0"`},
+		},
+		{
+			name:        "zero column is rejected",
+			link:        "./config.go:9:0",
+			wantHandled: true,
+			wantCalls:   []string{`open ./config.go:9:0: invalid source location ":9:0"`},
+		},
+		{
+			name:        "negative line is rejected",
+			link:        "./config.go:-1",
+			wantHandled: true,
+			wantCalls:   []string{`open ./config.go:-1: invalid source location ":-1"`},
+		},
+		{
+			name:        "negative line with column is rejected",
+			link:        "./config.go:-9:2",
+			wantHandled: true,
+			wantCalls:   []string{`open ./config.go:-9:2: invalid source location ":-9:2"`},
+		},
+		{
+			name:        "signed column is rejected",
+			link:        "./config.go:9:+2",
+			wantHandled: true,
+			wantCalls:   []string{`open ./config.go:9:+2: invalid source location ":9:+2"`},
+		},
+		{
+			name:        "overflowing line is rejected",
+			link:        "./config.go:2147483648",
+			wantHandled: true,
+			wantCalls: []string{
+				`open ./config.go:2147483648: invalid source location ":2147483648"`,
+			},
+		},
+		{
+			name:        "overflowing column is rejected",
+			link:        "./config.go:1:99999999999999999999",
+			wantHandled: true,
+			wantCalls: []string{
+				`open ./config.go:1:99999999999999999999: ` +
+					`invalid source location ":1:99999999999999999999"`,
+			},
+		},
+		{
+			name:        "location without a file is rejected",
+			link:        "./:99",
+			wantHandled: true,
+			wantCalls:   []string{`open ./:99: source location ":99" names no file`},
+		},
+		{
+			name:        "line and column without a file are rejected",
+			link:        "docs/:99:1",
+			wantHandled: true,
+			wantCalls:   []string{`open docs/:99:1: source location ":99:1" names no file`},
+		},
+		{
+			name:        "failed show stops before navigating",
+			link:        "./config.go:99",
+			showErr:     errors.New("permission denied"),
+			wantHandled: true,
+			wantCalls: []string{
+				"show " + configURI,
+				"open ./config.go:99: permission denied",
+			},
+		},
+		{
+			name:        "failed editor lookup stops before moving the cursor",
+			link:        "./config.go:99",
+			editorErr:   errors.New("handler not found"),
+			wantHandled: true,
+			wantCalls: []string{
+				"show " + configURI,
+				"editor " + configURI,
+				"open ./config.go:99: go to 99:1: handler not found",
+			},
+		},
+		{
+			name:        "file shown outside the workspace reports failed navigation",
+			cwd:         "ssh://alice@example.com/work/project",
+			link:        "file:///tmp/main.go:3",
+			editorErr:   errors.New("handler not found"),
+			wantHandled: true,
+			wantCalls: []string{
+				"show file:///tmp/main.go",
+				"editor file:///tmp/main.go",
+				"open file:///tmp/main.go:3: go to 3:1: handler not found",
+			},
+		},
+		{
+			name:        "failed cursor move notifies",
+			link:        "./config.go:99:7",
+			cursorErr:   errors.New("line out of range"),
+			wantHandled: true,
+			wantCalls: append(
+				goTo(configURI, "{X:6 Y:98}"),
+				"open ./config.go:99:7: go to 99:7: line out of range",
+			),
+		},
+		{
+			name:        "repeated navigation to an open file",
+			link:        "./config.go:99",
+			clicks:      2,
+			wantHandled: true,
+			wantCalls: append(
+				goTo(configURI, "{X:0 Y:98}"),
+				goTo(configURI, "{X:0 Y:98}")...,
+			),
+		},
 		{
 			name:        "https is shown",
 			link:        "https://example.com/repo",
@@ -1889,28 +2514,36 @@ func TestExtensionDialogueLinkClick(t *testing.T) {
 		{name: "query without path is declined", link: "?view=raw"},
 		{name: "network reference is declined", link: "//example.com/README.md"},
 		{name: "mailto is declined", link: "mailto:a@example.com"},
+		{name: "bare scheme-like destination is declined", link: "config.go:99"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			lock := &dialogueLock{}
-			io := &linkClickIO{lock: lock, showErr: tt.showErr}
+			io := &linkClickIO{
+				lock:      lock,
+				showErr:   tt.showErr,
+				editorErr: tt.editorErr,
+				cursorErr: tt.cursorErr,
+			}
 			cwd := tt.cwd
 			if cwd == "" {
 				cwd = "file:///workspace/project"
 			}
 			uri, err := workspaceapi.ParseURI(cwd)
 			require.NoError(t, err)
-			h := &aiEditorHandler{o: io, n: io, cwd: uri}
+			h := &aiEditorHandler{o: io, n: io, ed: io, cwd: uri}
 			link, err := url.Parse(tt.link)
 			require.NoError(t, err)
 			original := *link
 
-			// The dialogue holds its lock while it calls OnLinkClick.
-			lock.Lock()
-			handled := h.dialogueConfig(lock).OnLinkClick(link)
-			lock.Unlock()
-
-			assert.Equal(t, tt.wantHandled, handled)
+			onClick := h.dialogueConfig(lock).OnLinkClick
+			for range max(tt.clicks, 1) {
+				// The dialogue holds its lock while it calls OnLinkClick.
+				lock.Lock()
+				handled := onClick(link)
+				lock.Unlock()
+				assert.Equal(t, tt.wantHandled, handled)
+			}
 			assert.Equal(t, tt.wantCalls, io.calls)
 			assert.Equal(t, original, *link, "the caller's URL must not be mutated")
 		})
@@ -1938,14 +2571,17 @@ func (l *dialogueLock) Unlock() {
 	l.mu.Unlock()
 }
 
-// linkClickIO is a resource opener and notifications that record each
-// call, marking the ones made while lock was held.
+// linkClickIO is a resource opener, editor and notifications that record
+// each call, marking the ones made while lock was held.
 type linkClickIO struct {
 	stubNotifications
-	lock    *dialogueLock
-	showErr error
-	panics  bool
-	calls   []string
+	lock      *dialogueLock
+	showErr   error
+	editorErr error
+	cursorErr error
+	// panicsIn names the call that panics: "show", "editor" or "cursor".
+	panicsIn string
+	calls    []string
 }
 
 func (r *linkClickIO) Open(uri workspaceapi.URI) (browserapi.Handler, error) {
@@ -1955,10 +2591,28 @@ func (r *linkClickIO) Open(uri workspaceapi.URI) (browserapi.Handler, error) {
 
 func (r *linkClickIO) Show(uri workspaceapi.URI) error {
 	r.record("show " + uri.String())
-	if r.panics {
-		panic("host connection lost")
-	}
+	r.panicIn("show")
 	return r.showErr
+}
+
+func (r *linkClickIO) Editor(uri workspaceapi.URI) (textapi.Handler, error) {
+	r.record("editor " + uri.String())
+	r.panicIn("editor")
+	if r.editorErr != nil {
+		return nil, r.editorErr
+	}
+	return cursorTestHandler{TestHandler: browsertest.NewTestHandler(), uri: uri}, nil
+}
+
+func (r *linkClickIO) CellView(textapi.Handler) textapi.CellView {
+	r.record("cell view")
+	return cursorTestView{}
+}
+
+func (r *linkClickIO) SetCursor(h textapi.Handler, pos term.Coordinates) error {
+	r.record(fmt.Sprintf("cursor %s %+v", h.Resource(), pos))
+	r.panicIn("cursor")
+	return r.cursorErr
 }
 
 func (r *linkClickIO) Notify(
@@ -1966,6 +2620,12 @@ func (r *linkClickIO) Notify(
 ) (string, error) {
 	r.record(fmt.Sprintf(format, args...))
 	return "", nil
+}
+
+func (r *linkClickIO) panicIn(call string) {
+	if r.panicsIn == call {
+		panic("host connection lost")
+	}
 }
 
 func (r *linkClickIO) record(call string) {
@@ -1980,13 +2640,21 @@ func TestDialogueLinkClickLock(t *testing.T) {
 		width  = 40
 		height = 10
 		link   = "https://example.com/rune"
+		source = "[`GetGraphics`](internal/config/config.go:99)"
+		config = "file:///workspace/project/internal/config/config.go"
 	)
 	tests := []struct {
-		name      string
-		cwd       string
-		link      string
+		name string
+		cwd  string
+		link string
+		// message is the rendered response, linking label. It defaults
+		// to a runbook link to link.
+		message   string
+		label     string
 		showErr   error
-		panics    bool
+		editorErr error
+		cursorErr error
+		panicsIn  string
 		wantCalls []string
 	}{
 		{
@@ -2025,8 +2693,64 @@ func TestDialogueLinkClickLock(t *testing.T) {
 		{
 			name:      "panicking show hands the lock back",
 			link:      link,
-			panics:    true,
+			panicsIn:  "show",
 			wantCalls: []string{"show " + link},
+		},
+		{
+			name:    "source link navigates unlocked",
+			cwd:     "file:///workspace/project",
+			message: "Graphics are read by " + source + ".",
+			label:   "GetGraphics",
+			wantCalls: []string{
+				"show " + config,
+				"editor " + config,
+				"cursor " + config + " {X:0 Y:98}",
+			},
+		},
+		{
+			name:      "failed lookup notifies unlocked",
+			cwd:       "file:///workspace/project",
+			message:   source,
+			label:     "GetGraphics",
+			editorErr: errors.New("handler not found"),
+			wantCalls: []string{
+				"show " + config,
+				"editor " + config,
+				"open internal/config/config.go:99: go to 99:1: handler not found",
+			},
+		},
+		{
+			name:      "failed cursor move notifies unlocked",
+			cwd:       "file:///workspace/project",
+			message:   source,
+			label:     "GetGraphics",
+			cursorErr: errors.New("line out of range"),
+			wantCalls: []string{
+				"show " + config,
+				"editor " + config,
+				"cursor " + config + " {X:0 Y:98}",
+				"open internal/config/config.go:99: go to 99:1: line out of range",
+			},
+		},
+		{
+			name:      "panicking lookup hands the lock back",
+			cwd:       "file:///workspace/project",
+			message:   source,
+			label:     "GetGraphics",
+			panicsIn:  "editor",
+			wantCalls: []string{"show " + config, "editor " + config},
+		},
+		{
+			name:     "panicking cursor move hands the lock back",
+			cwd:      "file:///workspace/project",
+			message:  source,
+			label:    "GetGraphics",
+			panicsIn: "cursor",
+			wantCalls: []string{
+				"show " + config,
+				"editor " + config,
+				"cursor " + config + " {X:0 Y:98}",
+			},
 		},
 		{
 			name: "declined link does no I/O",
@@ -2037,11 +2761,13 @@ func TestDialogueLinkClickLock(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			lock := &dialogueLock{}
 			io := &linkClickIO{
-				lock:    lock,
-				showErr: tt.showErr,
-				panics:  tt.panics,
+				lock:      lock,
+				showErr:   tt.showErr,
+				editorErr: tt.editorErr,
+				cursorErr: tt.cursorErr,
+				panicsIn:  tt.panicsIn,
 			}
-			h := &aiEditorHandler{o: io, n: io}
+			h := &aiEditorHandler{o: io, n: io, ed: io}
 			if tt.cwd != "" {
 				var err error
 				h.cwd, err = workspaceapi.ParseURI(tt.cwd)
@@ -2051,10 +2777,14 @@ func TestDialogueLinkClickLock(t *testing.T) {
 			dh, tx, _ := dialoguetui.Handler(context.Background(), lock, comp, term.NopInterrupter())
 			defer close(tx)
 			dh.Resize(width, height)
-			comp.AddReceiveMessage("See [the rollout runbook](" + tt.link + ").")
+			message, label := tt.message, tt.label
+			if message == "" {
+				message, label = "See [the rollout runbook]("+tt.link+").", "the rollout runbook"
+			}
+			comp.AddReceiveMessage(message)
 			w := term.NewStringWriter(width, height)
 			dh.Draw(w)
-			pos, ok := cellOf(w, width, "the rollout runbook")
+			pos, ok := cellOf(w, width, label)
 			require.True(t, ok, "link drawn")
 
 			click := func() {
@@ -2062,7 +2792,7 @@ func TestDialogueLinkClickLock(t *testing.T) {
 					Type: term.EventMouse, Key: term.MouseLeft, MouseX: pos.X, MouseY: pos.Y,
 				})
 			}
-			if tt.panics {
+			if tt.panicsIn != "" {
 				assert.Panics(t, click)
 			} else {
 				click()
@@ -2088,4 +2818,301 @@ func cellOf(w *term.StringWriter, width int, text string) (term.Coordinates, boo
 		}
 	}
 	return term.Coordinates{}, false
+}
+
+// statusBarRow draws comp and returns its bottom row, the status bar.
+func statusBarRow(t *testing.T, sc syncComponent) string {
+	t.Helper()
+	const width, height = 40, 8
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.comp.Resize(width, height)
+	w := term.NewStringWriter(width, height)
+	sc.comp.Draw(w)
+	require.NoError(t, w.Flush())
+	lines := strings.Split(w.String(), "\n")
+	return strings.TrimSpace(lines[height-1])
+}
+
+func TestReloadStatusBar(t *testing.T) {
+	modelLayout, err := dialoguetui.ParseStatusBarLayout(`{{ .Model }}`)
+	require.NoError(t, err)
+	agentConfig := func(statusBar map[string]any) config.Config {
+		return config.MapConfig(map[string]any{"extensions": map[string]any{
+			extensionID: map[string]any{"config": map[string]any{"status_bar": statusBar}},
+		}})
+	}
+	tests := []struct {
+		name    string
+		host    config.Config
+		wantErr string
+		// wantRow is the open chat's bar after the reload; empty when
+		// it has none.
+		wantRow     string
+		wantEnabled bool
+		wantLayout  []dialoguetui.StatusBarComponent
+	}{
+		{
+			name:        "the agent's own block",
+			host:        agentConfig(map[string]any{"layout": `{{ .Effort }}`}),
+			wantRow:     "high",
+			wantEnabled: true,
+			wantLayout:  mustParseStatusBarLayout(t, `{{ .Effort }}`),
+		},
+		{
+			name:        "no block of its own",
+			host:        config.MapConfig(map[string]any{}),
+			wantEnabled: true,
+			wantRow:     "IDLE",
+		},
+		{
+			name: "a block that turns the bar off",
+			host: agentConfig(map[string]any{"enabled": false}),
+		},
+		{
+			name:        "a config that could not be fetched",
+			host:        config.ErrConfig(errors.New("closed")),
+			wantErr:     "closed",
+			wantRow:     "opus",
+			wantEnabled: true,
+			wantLayout:  modelLayout,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			initial := dialoguetui.StatusBarConfig{
+				Enabled: true, Layout: modelLayout, Storage: storagestub.NewInMemoryService(),
+			}
+			h := &aiEditorHandler{n: stubNotifications{}, p: term.NopInterrupter()}
+			h.cfg.StatusBar = initial
+			open := syncComponent{
+				mu:   new(sync.Mutex),
+				comp: dialoguetui.NewComponent(dialoguetui.ComponentConfig{StatusBar: initial}),
+			}
+			t.Cleanup(func() { assert.NoError(t, open.comp.Close()) })
+			open.setStatusBarState(func(s *dialoguetui.StatusBarState) { s.Model, s.Effort = "opus", "high" })
+			h.openChats.Store("open", open)
+			h.openChats.Store("opening", struct{}{})
+
+			err := h.reloadStyle(context.Background(), tt.host)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+			if tt.wantRow == "" {
+				assert.Zero(t, open.comp.StatusBarState(), "the open chat has no bar")
+			} else {
+				assert.Contains(t, statusBarRow(t, open), tt.wantRow)
+			}
+			next := h.dialogueConfig(new(sync.Mutex)).StatusBar
+			assert.Equal(t, tt.wantEnabled, next.Enabled, "a chat opened next")
+			assert.Equal(t, tt.wantLayout, next.Layout, "a chat opened next")
+			assert.NotNil(t, next.Storage, "the bar keeps caching its images")
+		})
+	}
+}
+
+func TestReloadStyleInputBoxFrame(t *testing.T) {
+	const width, height = 32, 6
+	// The asciiart writer draws a gray 128 pixel as 'a', a gray 40 one as
+	// '_' and a white one as '@'.
+	const opened = "                                \n" +
+		"                                \n" +
+		"                                \n" +
+		"  a────────────────────────a    \n" +
+		"  │                        │    \n" +
+		"  └────────────────────────┘    "
+	const unframed = "                                \n" +
+		"                                \n" +
+		"                                \n" +
+		"  ┌────────────────────────┐    \n" +
+		"  │                        │    \n" +
+		"  └────────────────────────┘    "
+	host := func(charset map[string]any) config.Config {
+		own := map[string]any{"status_bar": map[string]any{"enabled": false}}
+		if charset != nil {
+			own["input_box_frame_charset"] = charset
+		}
+		return config.MapConfig(map[string]any{"extensions": map[string]any{
+			extensionID: map[string]any{"config": own},
+		}})
+	}
+	openWith := func(gray string) config.Config {
+		return host(map[string]any{
+			"topleft":  "╓",
+			"graphics": map[string]any{"topleft": gray, "topright": gray},
+		})
+	}
+	tests := []struct {
+		name string
+		// edit draws the gray image the chat opened with in gray 40
+		// before the reload.
+		edit bool
+		// host is the config reloaded given the URIs of a gray and a
+		// white image.
+		host     func(gray, white string) config.Config
+		expected string
+	}{
+		{
+			name: "an edited image is read again",
+			edit: true,
+			host: func(gray, _ string) config.Config { return openWith(gray) },
+			expected: "                                \n" +
+				"                                \n" +
+				"                                \n" +
+				"  _────────────────────────_    \n" +
+				"  │                        │    \n" +
+				"  └────────────────────────┘    ",
+		},
+		{
+			name: "runes and images over the default frame",
+			host: func(_, white string) config.Config {
+				return host(map[string]any{
+					"topleft": "╔",
+					"graphics": map[string]any{
+						"bottomright": white, "bottomleft": "file:///missing.png",
+					},
+				})
+			},
+			expected: "                                \n" +
+				"                                \n" +
+				"                                \n" +
+				"  ╔────────────────────────┐    \n" +
+				"  │                        │    \n" +
+				"  └────────────────────────@    ",
+		},
+		{
+			name: "an invalid image keeps the default frame",
+			host: func(_, _ string) config.Config {
+				return host(map[string]any{
+					"topleft": "╓", "graphics": map[string]any{"topleft": "ftp://x/y.png"},
+				})
+			},
+			expected: unframed,
+		},
+		{
+			name:     "no charset of its own",
+			host:     func(_, _ string) config.Config { return host(nil) },
+			expected: unframed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			fileURI := func(name string, c color.Color) string {
+				path := filepath.Join(dir, name)
+				writeFramePNG(t, path, c)
+				return (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String()
+			}
+			gray := fileURI("gray.png", color.Gray{Y: 128})
+			white := fileURI("white.png", color.White)
+			own, err := ownConfig(openWith(gray))
+			require.NoError(t, err)
+
+			interrupts := make(chan struct{}, 1)
+			p := term.FuncInterrupter(func(context.Context) error {
+				select {
+				case interrupts <- struct{}{}:
+				default:
+				}
+				return nil
+			})
+			h := &aiEditorHandler{n: stubNotifications{}, p: p}
+			h.cfg = defaultComponentCfg
+			h.cfg.InputBox.FrameCharSet = inputBoxFrameCharSet(own)
+			h.cfg.InputBox.GraphicsStorage = storagestub.NewInMemoryService()
+			mu := new(sync.Mutex)
+			comp := dialoguetui.NewComponent(h.dialogueConfig(mu))
+			t.Cleanup(func() { assert.NoError(t, comp.Close()) })
+			dh, tx, _ := dialoguetui.Handler(context.Background(), mu, comp, p)
+			defer close(tx)
+			h.openChats.Store("open", syncComponent{mu: mu, comp: comp})
+			dh.Resize(width, height)
+			awaitChat(t, dh, width, height, interrupts, opened)
+
+			if tt.edit {
+				writeFramePNG(t, filepath.Join(dir, "gray.png"), color.Gray{Y: 40})
+			}
+			require.NoError(t, h.reloadStyle(context.Background(), tt.host(gray, white)))
+			awaitChat(t, dh, width, height, interrupts, tt.expected)
+
+			nextMu := new(sync.Mutex)
+			next := dialoguetui.NewComponent(h.dialogueConfig(nextMu))
+			t.Cleanup(func() { assert.NoError(t, next.Close()) })
+			nextH, nextTx, _ := dialoguetui.Handler(context.Background(), nextMu, next, p)
+			defer close(nextTx)
+			nextH.Resize(width, height)
+			awaitChat(t, nextH, width, height, interrupts, tt.expected)
+		})
+	}
+}
+
+// awaitChat redraws h on every interrupt until it draws expected with
+// the asciiart writer; the frame images load in the background.
+func awaitChat(
+	t *testing.T, h tui.Handler, width, height int,
+	interrupts <-chan struct{}, expected string,
+) {
+	t.Helper()
+	w := asciiart.NewStringWriter(width, height, asciiart.DefaultConfig())
+	timeout := time.After(10 * time.Second)
+	for {
+		require.NoError(t, w.Clear(term.Attributes{}))
+		h.Draw(w)
+		require.NoError(t, w.Flush())
+		if w.String() == expected {
+			return
+		}
+		select {
+		case <-interrupts:
+		case <-time.After(10 * time.Millisecond):
+		case <-timeout:
+			require.Equal(t, expected, w.String())
+		}
+	}
+}
+
+func writeFramePNG(t *testing.T, path string, c color.Color) {
+	t.Helper()
+	img := stdimage.NewNRGBA(stdimage.Rect(0, 0, 1, 1))
+	img.Set(0, 0, c)
+	var buf bytes.Buffer
+	require.NoError(t, png.Encode(&buf, img))
+	require.NoError(t, os.WriteFile(path, buf.Bytes(), 0o600))
+}
+
+func mustParseStatusBarLayout(t *testing.T, layout string) []dialoguetui.StatusBarComponent {
+	t.Helper()
+	parsed, err := dialoguetui.ParseStatusBarLayout(layout)
+	require.NoError(t, err)
+	return parsed
+}
+
+func TestWatchReloadFetchesTheConfigOnEachSignal(t *testing.T) {
+	h := &aiEditorHandler{n: stubNotifications{}, p: term.NopInterrupter()}
+	h.cfg.StatusBar = dialoguetui.StatusBarConfig{Enabled: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	reload := make(chan os.Signal)
+	fetched := make(chan struct{}, 2)
+	done := make(chan struct{})
+	go debug.CapturePanicReport(func() {
+		defer close(done)
+		h.watchReload(ctx, reload, func(context.Context) config.Config {
+			fetched <- struct{}{}
+			return config.MapConfig(map[string]any{"extensions": map[string]any{
+				extensionID: map[string]any{"config": map[string]any{
+					"status_bar": map[string]any{"enabled": false},
+				}},
+			}})
+		})
+	})
+
+	for range 2 {
+		reload <- os.Interrupt
+		<-fetched
+	}
+	cancel()
+	<-done
+	assert.False(t, h.dialogueConfig(new(sync.Mutex)).StatusBar.Enabled)
 }

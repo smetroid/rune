@@ -14,39 +14,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-package ide
+//go:build windows
 
-import (
-	"sync"
-	"testing"
-)
+package extensionv2
 
-func TestLazyParserConcurrentInit(t *testing.T) {
-	lp := &lazyParser{root: &workspaceManagerHandler{}}
+import "syscall"
 
-	const goroutines = 64
-	var start sync.WaitGroup
-	start.Add(1)
-	var done sync.WaitGroup
-	results := make([]any, goroutines)
-	for i := range results {
-		done.Add(1)
-		go func(i int) {
-			defer done.Done()
-			start.Wait()
-			results[i] = lp.parser()
-		}(i)
-	}
-	start.Done()
-	done.Wait()
-
-	first := results[0]
-	if first == nil {
-		t.Fatal("parser() returned nil")
-	}
-	for i, got := range results {
-		if got != first {
-			t.Fatalf("goroutine %d got a different parser instance: %v != %v", i, got, first)
-		}
-	}
-}
+// reloadSignal is none: Windows has no signal an extension could handle.
+const reloadSignal syscall.Signal = 0

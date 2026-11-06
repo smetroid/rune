@@ -1296,12 +1296,13 @@ func TestAuthorizerAuthorizeCommandShowsRecursiveDeletesWithTheHostDataDir(t *te
 
 	err := a.AuthorizeCommand(ctx, workspaceapi.Cmd{
 		Path: "bash",
-		Args: []string{"-c", `rm -rf $RUNE_DATADIR/cache; X=/tmp/x; rm -r "$X"; sudo rm -r /tmp/x`},
+		Args: []string{"-c", `rm -rf $RUNE_DATADIR/cache; X=/tmp/x; rm -r "$X"; sudo rm -r /tmp/x; ` +
+			`rmdir $RUNE_DATADIR/lib`},
 	})
 	require.NoError(t, err)
 	require.Equal(t, 1, opener.calls)
 	assert.Contains(t, opener.messages[0], "⚠️ **Removes recursively**, as the shell will run it:"+
-		"\n\n```\nrm -rf /host/.rune/cache\nrm -r /tmp/x\n```")
+		"\n\n```\nrm -rf /host/.rune/cache\nrm -r /tmp/x\nrmdir /host/.rune/lib\n```")
 }
 
 const moveTestsScript = `M=/tmp/movetests/movetests; D=internal/workspace/vtescheme; set -e
@@ -1920,6 +1921,15 @@ func TestAuthorizerAsksEveryTimeWhenNoDecisionForGoodCanCoverTheCommand(t *testi
 	}{
 		{name: "programs that cannot be told",
 			cmd:  workspaceapi.Cmd{Path: "/bin/bash", Args: []string{"-c", "$CMD args"}},
+			want: "\n\nRune asks every time because it runs no program a scope can describe."},
+		{name: "only builtins that run nothing",
+			cmd:  workspaceapi.Cmd{Path: "/bin/bash", Args: []string{"-c", "cd /tmp; : > x"}},
+			want: "\n\nRune asks every time because it runs no program a scope can describe."},
+		{name: "ansi-c escapes in a command name",
+			cmd:  workspaceapi.Cmd{Path: "/bin/bash", Args: []string{"-c", `$'\x72m' -rf x`}},
+			want: "\n\nRune asks every time because it runs no program a scope can describe."},
+		{name: "zsh equals expansion in the command name",
+			cmd:  workspaceapi.Cmd{Path: "/bin/zsh", Args: []string{"-c", "=rm -rf x"}},
 			want: "\n\nRune asks every time because it runs no program a scope can describe."},
 		{name: "program in a directory not known until it runs",
 			cmd:  workspaceapi.Cmd{Path: "bash", Args: []string{"-c", "cd sub && ./build --fast"}},

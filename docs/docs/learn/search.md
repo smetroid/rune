@@ -23,6 +23,8 @@ At a glance:
 | [Find a type definition anywhere in the workspace](#search-across-the-workspace) | `searchtype` | <KeyBinding command="searchtype" /> |
 | [Search a file by name](#search-files) | `searchfile` | <KeyBinding command="searchfile" /> |
 | [Search file contents across the workspace](#search-text) | `searchtext` | <KeyBinding command="searchtext" /> |
+| [Search the workspace for a regular expression](#search-with-a-regular-expression) | `searchregex <pattern>` | (define your own) |
+| [Find code by what it does](#search-by-meaning) | `searchsemantic <query>` | (define your own) |
 | [Jump to an arbitrary symbol's definition](#semantic-symbol-search) | `lsp definition <symbol>` | <KeyBinding command="echo {prompt}lsp<space>definition<space>" /> |
 | [Open an arbitrary symbol's documentation](#semantic-symbol-search) | `lsp hover <symbol>` | <KeyBinding command="echo {prompt}lsp<space>hover<space>" /> |
 | [List an arbitrary symbol's references](#semantic-symbol-search) | `lsp references <symbol>` | <KeyBinding command="echo {prompt}lsp<space>references<space>" /> |
@@ -105,6 +107,158 @@ files by name across the workspace and press `<enter>` to open the match.
 
 `searchtext` (<KeyBinding command="searchtext" />) searches file contents across the workspace and
 presents the matches in a fuzzy picker, jumping you to the line you pick.
+
+## Search with a regular expression
+
+`searchregex` searches every file of the workspace for a regular
+expression and floats the matching lines in a picker, one per line, the
+way `grep` lists them:
+
+```
+searchregex 'func\s+New\w*\('
+```
+
+The preview above the list shows the focused line in its file with its
+matches emphasized. The status bar at the bottom counts the matching
+lines and their files, says how long the search took and how it was
+asked for, and says when it stopped at the limit or when the index was
+not ready and it read every file. On its right it says which of its
+file's matches the focused line is, and where. A red `ERROR` label
+replaces `REGEXP` when the search failed. Type to narrow the results
+down and press `<enter>` to jump to the match.
+
+Flags go anywhere in the pattern:
+
+| Flag | Does |
+| --- | --- |
+| `-i`, `--ignore-case` | ignores case |
+| `-F`, `--fixed-strings` | searches for the pattern as plain text |
+| `-r <dir>`, `--root <dir>` | searches only in this folder; repeat it for several |
+| `-n <limit>`, `--limit <limit>` | lists at most this many lines (5000 by default) |
+| `--` | ends the flags, so the rest is the pattern even if it starts with `-` |
+
+Patterns use the RE2 regular expression syntax. `^` and `$` match at the
+start and end of every line, and a match never spans lines. The command
+prompt reads a backslash outside quotes as an escape and joins the words
+of a pattern with single spaces, so single-quote a pattern that has
+backslashes or runs of spaces.
+
+`searchregex` skips binary files and files larger than 64 MB, and like
+the rest of workspace search it leaves out what git ignores, hidden
+folders, and the folders in `search.excluded_folders`. As in ripgrep,
+that only applies below a root: `searchregex -r .github runs-on` searches
+the hidden `.github` folder because `-r` names it.
+
+Rune keeps a trigram index of each workspace, so a search reads only the
+files that may match and answers in milliseconds even in large
+repositories. Rune builds the index in the background when you open the
+workspace and keeps it up to date as files change. Until the index is
+ready, or with `search.regex_enabled` off, `searchregex` reads every file. See
+[Workspace search](../agent/local-models.md#workspace-search) for the
+`search` settings.
+
+The same index answers the agent's `search_content` tool, and
+[`runectl search regexp`](../develop/runectl.md) from a Rune terminal:
+
+```
+runectl search regexp -g '*.go' 'func\s+New\w*\('
+```
+
+## Search by meaning
+
+Semantic indexing is off by default. Enable `search.semantic_enabled`
+(`true` in YAML, `True` in Starlark) and restart Rune before using
+`searchsemantic`. Regexp and symbol indexing are unaffected by the semantic
+setting, and semantic indexing does not require regexp indexing.
+
+`searchsemantic` finds code by describing what it does, so you do not
+have to guess the words it uses:
+
+```
+searchsemantic where is the retry backoff computed
+```
+
+The results float in a picker, best first, each at the line it matched.
+The preview above the list highlights the result's line and emphasizes
+the query's words in the stretch of code that matched. The status bar at
+the bottom says how the result ranked: its score, how far its meaning
+stood out (`z`) and how close it came (`cos`), its rank by words, and
+whether it trails far behind the best ones, with the lines that matched
+on the right. Type to narrow the results down and press `<enter>` to
+open one.
+
+While Rune is still indexing the workspace, files it has not reached may
+be missing from the results, and the status bar says so: `1204 files left
+to index`, or `indexing stalled:` and why. When a query could not be
+ranked by meaning, for instance before the embedding model is
+downloaded, the status bar says `matched by words only:` and why.
+
+When the embedding model cannot run, for instance because the local
+model server failed to load it, `searchsemantic` searches the
+workspace's trigram index for the query's words instead. The status bar
+then shows a red `ERROR` label, and Rune's log says why the model could
+not run.
+
+Flags go anywhere in the query:
+
+| Flag | Does |
+| --- | --- |
+| `-r <dir>`, `--root <dir>` | searches only in this folder; repeat it for several |
+| `-n <limit>`, `--limit <limit>` | lists at most this many results (20 by default) |
+| `--meaning=false` | searches by words alone |
+| `--prefix-last` | also matches the last word as a prefix |
+| `--` | ends the flags, so the rest is the query even if it starts with `-` |
+
+### Semantic-search requirements
+
+Only **searching by meaning** needs an embedding model and `llama-server`.
+Text, regex, filename, structural and language-server symbol searches do
+not need them. Neither does `searchsemantic --meaning=false`, which
+searches by words alone.
+
+By default, Rune uses [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2)
+through `ggml-org/embeddinggemma-2-GGUF:Q8_0`. It loads only the 270M-parameter
+text model, not the full 740M-parameter model's vision and audio encoders.
+Embedding runs on the machine running Rune, including for SSH workspaces.
+
+- **Setup:** when the server or model is missing, `searchsemantic` offers
+  to install the `llama-server` package and download the model. It also
+  offers to upgrade an installed server that is too old. Say yes, and
+  Rune tells you when the command is ready. Once installed, embedding
+  needs no API key or network connection.
+- **CPU or GPU:** a dedicated GPU is not required. The packaged server
+  supports macOS 13.3+ on Apple Silicon or Intel, with Metal acceleration,
+  and Linux on x86-64 or arm64 with glibc 2.35+. See
+  [Server requirements](../agent/local-models.md#server-requirements)
+  for platform details and custom builds.
+- **Disk:** the current [Q8_0 download](https://huggingface.co/ggml-org/embeddinggemma-2-GGUF)
+  is about **865 MB**: 310 MB of text weights plus a 555 MB media projector.
+  Rune downloads both, but does not load the projector for code search.
+  Allow extra space for the server package and workspace indexes.
+- **Memory:** model-file size is not a RAM requirement. Inference buffers,
+  indexing and the editor need additional memory; a local chat model uses
+  a separate server and adds its own footprint. Google does not specify a
+  fixed minimum RAM or VRAM, and Rune has no measured minimum for this
+  workload. The embedding server starts on demand and stops after being
+  idle.
+
+Rune adds Google's code-retrieval and document prefixes automatically,
+uses mean pooling, and L2-normalizes the full 768-dimensional vectors.
+You do not need to add a task prefix to your query. The model supports
+8,192 tokens, but Rune currently uses a **2,048-token embedding context**
+and indexes code in smaller chunks rather than embedding whole files.
+
+:::caution[Inference precision]
+Google requires **BF16 or FP32 activations**, not FP16, which can produce
+invalid or silently degraded embeddings. `Q8_0` describes weight
+quantization, not activation precision. Rune relies on llama.cpp's
+backend kernels, some of which use FP16 intermediates, so it does not
+currently guarantee BF16/FP32-only inference across backends. See the
+[model card's precision guidance](https://huggingface.co/google/embeddinggemma-2#4-numerical-precision).
+:::
+
+See [Workspace search](../agent/local-models.md#workspace-search) for what
+is indexed and how to configure it.
 
 ## Semantic symbol search
 

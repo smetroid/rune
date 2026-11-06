@@ -38,6 +38,7 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/iterator"
 	"unstable.build/rune/cmd/rune-agent/agent/audit"
 	"unstable.build/rune/cmd/rune-agent/agent/skills"
+	"unstable.build/rune/cmd/rune-agent/agent/toolpolicy"
 	"unstable.build/rune/cmd/rune-agent/agent/utf8validate"
 	"unstable.build/rune/cmd/rune-agent/dialogue/dialoguemanager"
 	"unstable.build/rune/cmd/rune-agent/hooks"
@@ -48,7 +49,7 @@ import (
 
 // Config holds agent configuration.
 type Config struct {
-	MaxIterations      int
+	MaxIterations      int     // 0 means unlimited (the default); negative values use the default.
 	MaxToolOutputBytes int     // 0 uses DefaultMaxToolOutputBytes.
 	AutoCompactRatio   float64 // 0 uses defaultAutoCompactRatio.
 	SystemPrompt       string
@@ -85,6 +86,12 @@ type Config struct {
 	// must handle this case (typically by allowing the operation or
 	// returning an error).
 	Prompter Prompter
+
+	// Tools restricts the skills the agent is shown, and is propagated to
+	// tool executions through the context (see WithToolPolicy) so that
+	// the sub-agents its tools spawn inherit it. The registry the agent
+	// is given must already be restricted by it (see Registry.WithPolicy).
+	Tools toolpolicy.Policy
 }
 
 // Memory represents a single recalled memory entry.
@@ -224,8 +231,8 @@ func NewAgent(
 	if memory == nil {
 		panic("agent: memory must not be nil")
 	}
-	if config.MaxIterations <= 0 {
-		config.MaxIterations = 500
+	if config.MaxIterations < 0 {
+		config.MaxIterations = 0
 	}
 	if config.Hooks == nil {
 		// Auto-initialize so call sites can dispatch hooks
@@ -450,6 +457,22 @@ func (p *readCoverage) record(o *ReadObservation) {
 	p.coverage = append(p.coverage, *o)
 }
 
+// visibleSkills returns the skills the agent is shown: none without a
+// skill tool, and otherwise those its tool policy allows.
+func (a *Agent) visibleSkills() []skills.Skill {
+	if _, ok := a.registry.Get("skill", a.provider()); !ok {
+		return nil
+	}
+	all := a.skillRegistry.List()
+	visible := all[:0]
+	for _, s := range all {
+		if a.config.Tools.AllowsSkill(s.Name) {
+			visible = append(visible, s)
+		}
+	}
+	return visible
+}
+
 func (a *Agent) run(
 	ctx context.Context, ch chan<- Event,
 	dialogueID string, userMessage string, opts runOptions,
@@ -656,7 +679,6 @@ func (a *Agent) run(
 	var reads readCoverage
 	var infos []toolCallInfo
 	var toolMsgs []llmapi.Message
-	var imageContentParts []llmapi.ContentPart
 	// stopHookActive is set to true once the Stop hook has blocked
 	// once and we appended a continuation message. The second
 	// invocation passes this flag in the payload and ignores blocks.
@@ -690,7 +712,7 @@ func (a *Agent) run(
 		checkpointStart = time.Now()
 		return true
 	}
-	for i := range a.config.MaxIterations {
+	for i := 0; a.config.MaxIterations == 0 || i < a.config.MaxIterations; i++ {
 		log.Debug("agent loop iteration",
 			"iteration", i, "messages", len(messages))
 
@@ -713,7 +735,7 @@ func (a *Agent) run(
 		if instructions != "" {
 			transient = append(transient, llmapi.Message{Role: llmapi.RoleSystem, Content: instructions})
 		}
-		if section := skillsPromptSection(a.skillRegistry.List()); section != "" {
+		if section := skillsPromptSection(a.visibleSkills()); section != "" {
 			transient = append(transient, llmapi.Message{Role: llmapi.RoleSystem, Content: section})
 		}
 		if preloadedSkillMsg != "" {
@@ -1136,6 +1158,10 @@ func (a *Agent) run(
 			}
 
 			results := make(chan executedToolCall, len(infos))
+			toolConversation := messages
+			if serialize {
+				toolConversation = slices.Clone(messages)
+			}
 			var wg sync.WaitGroup
 			for i, info := range infos {
 				wg.Add(1)
@@ -1160,7 +1186,9 @@ func (a *Agent) run(
 							toolCtx = WithHooks(toolCtx, a.config.Hooks)
 							toolCtx = WithWorkspaceURI(toolCtx, a.config.Workspace)
 							toolCtx = WithDialogueID(toolCtx, dialogueID)
+							toolCtx = WithConversation(toolCtx, toolConversation)
 							toolCtx = WithPrompter(toolCtx, a.config.Prompter)
+							toolCtx = WithToolPolicy(toolCtx, a.config.Tools)
 							toolStart := time.Now()
 							result = info.tool.Execute(toolCtx, info.call.Function.Arguments)
 							dur = time.Since(toolStart)
@@ -1170,6 +1198,19 @@ func (a *Agent) run(
 								"output", len(result.Content),
 								"duration", dur,
 							)
+						}
+						// Ordered edits can refer to images produced earlier in this
+						// batch, before fan-in persists the hidden user message.
+						if serialize && !result.IsError {
+							var images []llmapi.ContentPart
+							for _, part := range result.MultiContent {
+								if part.Type == llmapi.ContentPartTypeImageURL {
+									images = append(images, part)
+								}
+							}
+							if len(images) > 0 {
+								toolConversation = append(toolConversation, llmapi.Message{Role: llmapi.RoleUser, MultiContent: images})
+							}
 						}
 						uncapped := result.Content
 						capToolResult(&result, maxOutput)
@@ -1200,9 +1241,9 @@ func (a *Agent) run(
 			toolMsgs = slices.Grow(toolMsgs[:0], len(infos))[:len(infos)]
 			clear(toolMsgs)
 			compacted := false
-			// Image parts may carry large data URLs; clear before truncating.
-			clear(imageContentParts)
-			imageContentParts = imageContentParts[:0]
+			// Allocated per batch: the synthetic image message below keeps this
+			// slice, so reusing it would overwrite images from earlier batches.
+			var imageContentParts []llmapi.ContentPart
 			var diagCandidates []executedToolCall
 			for tr := range results {
 				result := tr.result

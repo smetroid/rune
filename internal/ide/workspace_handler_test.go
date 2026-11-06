@@ -17,9 +17,14 @@
 package ide
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"maps"
 	"os"
@@ -44,6 +49,7 @@ import (
 	"github.com/unstablebuild/blue/release/docrelease"
 	"github.com/unstablebuild/rune-go-sdk/api/browserapi"
 	"github.com/unstablebuild/rune-go-sdk/api/config"
+	"github.com/unstablebuild/rune-go-sdk/api/config/configrpc"
 	"github.com/unstablebuild/rune-go-sdk/api/extensionapi"
 	"github.com/unstablebuild/rune-go-sdk/api/schemeapi"
 	"github.com/unstablebuild/rune-go-sdk/api/storageapi"
@@ -58,11 +64,13 @@ import (
 	sdkiterator "github.com/unstablebuild/rune-go-sdk/iterator"
 	"github.com/unstablebuild/rune-go-sdk/term"
 	"github.com/unstablebuild/rune-go-sdk/tui"
+	"google.golang.org/grpc"
 	"unstable.build/rune/internal/browser"
 	"unstable.build/rune/internal/browser/browsertest"
 	"unstable.build/rune/internal/cell"
 	tcomponent "unstable.build/rune/internal/component"
 	"unstable.build/rune/internal/component/asciiart"
+	"unstable.build/rune/internal/component/fileexplorer/fileexplorertest"
 	"unstable.build/rune/internal/component/imageuri/imageuritest"
 	"unstable.build/rune/internal/component/notifications"
 	"unstable.build/rune/internal/component/shader"
@@ -79,6 +87,7 @@ import (
 	"unstable.build/rune/internal/ide/idetask"
 	"unstable.build/rune/internal/ide/plugin"
 	"unstable.build/rune/internal/ide/vctrl/testgit"
+	"unstable.build/rune/internal/llm/llamaserver"
 	"unstable.build/rune/internal/localstorage"
 	"unstable.build/rune/internal/sounds"
 	"unstable.build/rune/internal/term/programstatus"
@@ -401,6 +410,165 @@ func TestFileExplorerReactsToFilesystemChangesIntegration(t *testing.T) {
 			InputSequence: "<c-\\\\>fexplorer<enter>",
 			Expected:      reopenedFrame,
 		}})
+}
+
+func TestFileExplorerFlushIntegration(t *testing.T) {
+	cases := []struct {
+		name string
+		// files seeds the workspace; see fileexplorertest.WriteTree.
+		files map[string]string
+		// keys edits the explorer, which starts focused with every
+		// directory collapsed and the cursor on the first row. The
+		// edit is then written and the confirmation accepted.
+		keys string
+		// want is the workspace afterwards; see
+		// fileexplorertest.ReadTree.
+		want map[string]string
+	}{
+		{
+			name: "cut_paste_collapsed_dir_into_sibling",
+			files: map[string]string{
+				"agent/agent.go":            "agent",
+				"toolpolicy/policy.go":      "policy",
+				"toolpolicy/policy_test.go": "test",
+			},
+			// Rows after <enter>: agent/, │agent.go, toolpolicy/.
+			keys: "<enter>jjddp\\>\\>",
+			want: map[string]string{
+				"agent/agent.go":                  "agent",
+				"agent/toolpolicy/policy.go":      "policy",
+				"agent/toolpolicy/policy_test.go": "test",
+			},
+		},
+		{
+			name: "cut_paste_expanded_dir_into_sibling",
+			files: map[string]string{
+				"agent/agent.go":            "agent",
+				"toolpolicy/policy.go":      "policy",
+				"toolpolicy/policy_test.go": "test",
+			},
+			// Rows after both <enter>s: agent/, │agent.go,
+			// toolpolicy/, │policy.go, │policy_test.go.
+			keys: "<enter>jj<enter>3ddp\\>\\>j\\>\\>j\\>\\>",
+			want: map[string]string{
+				"agent/agent.go":                  "agent",
+				"agent/toolpolicy/policy.go":      "policy",
+				"agent/toolpolicy/policy_test.go": "test",
+			},
+		},
+		{
+			name: "replace_empty_dir_with_moved_dir",
+			files: map[string]string{
+				"agent/agent.go":            "agent",
+				"agent/toolpolicy/":         "",
+				"toolpolicy/policy.go":      "policy",
+				"toolpolicy/policy_test.go": "test",
+			},
+			// Rows after <enter>: agent/, │toolpolicy/, │agent.go,
+			// toolpolicy/.
+			keys: "<enter>jddj<enter>3ddp\\>\\>j\\>\\>j\\>\\>",
+			want: map[string]string{
+				"agent/agent.go":                  "agent",
+				"agent/toolpolicy/policy.go":      "policy",
+				"agent/toolpolicy/policy_test.go": "test",
+			},
+		},
+		{
+			name: "move_dir_carries_gitignored_files",
+			files: map[string]string{
+				".gitignore":           "*.log\n",
+				"agent/":               "",
+				"toolpolicy/debug.log": "log",
+				"toolpolicy/policy.go": "policy",
+			},
+			// Rows after j<enter>: agent/, toolpolicy/, │policy.go,
+			// .gitignore.
+			keys: "j<enter>\\>\\>j\\>\\>",
+			want: map[string]string{
+				".gitignore":                 "*.log\n",
+				"agent/toolpolicy/debug.log": "log",
+				"agent/toolpolicy/policy.go": "policy",
+			},
+		},
+		{
+			name: "delete_collapsed_dir",
+			files: map[string]string{
+				"keep.go":      "keep",
+				"pkg/a.go":     "a",
+				"pkg/sub/b.go": "b",
+			},
+			keys: "dd",
+			want: map[string]string{"keep.go": "keep"},
+		},
+		{
+			name: "delete_expanded_dir",
+			files: map[string]string{
+				"keep.go":      "keep",
+				"pkg/a.go":     "a",
+				"pkg/sub/b.go": "b",
+			},
+			// Rows after <enter>: pkg/, │sub/, │a.go, keep.go.
+			keys: "<enter>3dd",
+			want: map[string]string{"keep.go": "keep"},
+		},
+		{
+			name:  "move_file_out_then_delete_its_dir",
+			files: map[string]string{"src/a.go": "a", "src/b.go": "b"},
+			// Rows after <enter>: src/, │a.go, │b.go.
+			keys: "<enter>jcc-<space>a.go<esc>jddggdd",
+			want: map[string]string{"a.go": "a"},
+		},
+		{
+			name:  "rename_chain",
+			files: map[string]string{"a": "A", "b": "B"},
+			keys:  "jcc-<space>c<esc>kcc-<space>b<esc>",
+			want:  map[string]string{"b": "A", "c": "B"},
+		},
+		{
+			name:  "rename_swap",
+			files: map[string]string{"a": "A", "b": "B"},
+			keys:  "cc-<space>b<esc>jcc-<space>a<esc>",
+			want:  map[string]string{"a": "B", "b": "A"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The watcher reports canonical paths; see
+			// TestFileExplorerReactsToFilesystemChangesIntegration.
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			require.NoError(t, err)
+			fileexplorertest.WriteTree(t, dir, tc.files)
+
+			cfg := defaultConfigWithWrap(false)
+			editorCfg := cfg.cfg["editor"].(map[string]any)
+			editorCfg["mode"] = editorModeVim
+			editorCfg["file_explorer"] = map[string]any{"read_only": false}
+			uri, err := workspaceapi.ParseURI("file://" + dir)
+			require.NoError(t, err)
+			m := newTestWorkspaceManagerHandlerWithDirs(t, cfg, dir,
+				t.TempDir(), nopShutdownShaderConfig())
+			require.NoError(t, m.addOrCreateWorkspace(uri))
+			m.quiesce()
+			t.Cleanup(func() { _ = m.Close() })
+
+			h := newSafeHandler(m)
+			h.Resize(60, 24)
+			sendExplorerKeys(t, h, "<c-\\\\>fexplorer<enter>")
+			m.mu.Lock()
+			ex := m.focusEx()
+			_, err = ex.comp.SetFocus(ex.fileExplorerWin)
+			m.mu.Unlock()
+			require.NoError(t, err)
+
+			sendExplorerKeys(t, h, tc.keys+"<c-\\\\>write<enter>y")
+
+			m.mu.Lock()
+			rows := ex.fileExplorerHandler.buf.String()
+			m.mu.Unlock()
+			assert.Equal(t, tc.want, fileexplorertest.ReadTree(t, dir),
+				"explorer after write:\n%s", rows)
+		})
+	}
 }
 
 func TestGitlinkIntegration(t *testing.T) {
@@ -3482,6 +3650,71 @@ func TestReadfileCrossWorkspaceIntegration(t *testing.T) {
 		_, ok = m.workspaces[1].ex.comp.FocusTab()
 		assert.False(t, ok)
 	})
+}
+
+func TestSiblingDirectoryOpenRoutingIntegration(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		sdkOpen bool
+	}{
+		{"SDK workspace open", true},
+		{"SDK workspace not open", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			mainDir := filepath.Join(root, "src", "rune")
+			sdkDir := filepath.Join(root, "src", "rune-go-sdk")
+			worktreeDir := filepath.Join(root, "worktrees", "RUNE-389")
+			for _, dir := range []string{mainDir, sdkDir, worktreeDir} {
+				require.NoError(t, os.MkdirAll(dir, 0o755))
+			}
+			targetPath := filepath.Join(sdkDir, "definition.go")
+			require.NoError(t, os.WriteFile(targetPath, []byte("package sdk\n"), 0o666))
+			targetURI, err := workspaceapi.ParseURI("file://" + targetPath)
+			require.NoError(t, err)
+
+			m := newTestWorkspaceManagerHandlerWithDir(t, defaultConfigWithWrap(false), "",
+				nopShutdownShaderConfig())
+			t.Cleanup(func() {
+				require.NoError(t, m.Close())
+			})
+			dirs := []string{mainDir}
+			if tc.sdkOpen {
+				dirs = append(dirs, sdkDir)
+			}
+			dirs = append(dirs, worktreeDir)
+			for _, dir := range dirs {
+				uri, err := workspaceapi.ParseURI("file://" + dir)
+				require.NoError(t, err)
+				require.NoError(t, m.addOrCreateWorkspace(uri))
+				m.waitForWorkspace(t, uri)
+			}
+
+			origin := len(dirs) - 1
+			wantFocus := origin
+			if tc.sdkOpen {
+				wantFocus = 1
+			}
+			var openedTab *browser.Tab
+			m.locked(func() {
+				require.True(t, m.switchToWorkspace(origin))
+				e := m.workspaces[origin].ex
+				openedTab, err = e.editFileURI(targetURI, e.invokeWindow(), false)
+			})
+			require.NoError(t, err)
+			m.quiesce()
+
+			m.locked(func() {
+				assert.Equal(t, wantFocus, m.focus)
+				assert.Empty(t, m.workspaces[0].ex.comp.Tabs())
+				focusTab, ok := m.workspaces[wantFocus].ex.comp.FocusTab()
+				require.True(t, ok)
+				assert.Same(t, openedTab, focusTab)
+				assert.Equal(t, targetURI.String(), focusTab.URI().String())
+				assert.Len(t, m.workspaces[wantFocus].ex.comp.Tabs(), 1)
+			})
+		})
+	}
 }
 
 func TestCrossWorkspaceOpenRoutingIntegration(t *testing.T) {
@@ -7685,6 +7918,9 @@ func defaultCfg() ideConfig {
 		"notifications": map[string]any{
 			"progress_bar": false,
 		},
+		// keep goldens deterministic: indexing runs in the background and
+		// posts its progress whenever it gets to it.
+		"search": map[string]any{"regex_enabled": false, "semantic_enabled": false},
 	},
 		configPath: "not-empty",
 		sounds:     sounds.Silent,
@@ -7712,6 +7948,8 @@ func (f fnRunner) Run(extensionID, path string, config config.Config) error {
 func (f fnRunner) Close() error {
 	return nil
 }
+
+func (f fnRunner) SignalReload() int { return 0 }
 
 func (f fnRunner) WaitReady(ctx context.Context, id string) error {
 	return nil
@@ -9568,6 +9806,8 @@ func (r *waitReadyRunner) Run(extensionID, path string, config config.Config) er
 
 func (r *waitReadyRunner) Close() error { return nil }
 
+func (r *waitReadyRunner) SignalReload() int { return 0 }
+
 func (r *waitReadyRunner) WaitReady(ctx context.Context, id string) error {
 	if r.waitErr != nil {
 		return r.waitErr
@@ -9615,6 +9855,8 @@ func (r *perIDReadyRunner) Run(extensionID, path string, config config.Config) e
 }
 
 func (r *perIDReadyRunner) Close() error { return nil }
+
+func (r *perIDReadyRunner) SignalReload() int { return 0 }
 
 func (r *perIDReadyRunner) WaitReady(ctx context.Context, id string) error {
 	ch := r.chanFor(id)
@@ -12040,4 +12282,641 @@ func TestWorkspaceNextPreviousCycleOpenWorkspaces(t *testing.T) {
 	assert.Equal(t, other, m.focus, "previous wraps around, skipping empty slots")
 	require.NoError(t, m.focusEx().dispatchCommand("workspaceprevious"))
 	assert.Equal(t, start, m.focus)
+}
+
+func TestLocalServerLocatorHonorsServerBinPath(t *testing.T) {
+	h := &workspaceManagerHandler{pkgmanager: new(localPkgManager)}
+	got, err := h.localServerLocator(llamaserver.Config{ServerBinPath: "/opt/llama/llama-server"}).
+		Locate(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "/opt/llama/llama-server", got)
+}
+
+// executorRunner runs commands on the executor its workspace's
+// extensions are given, and closes it with them, as the real runner does.
+type executorRunner struct {
+	testRunner
+	schemeapi.Executor
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+func (r executorRunner) Close() error {
+	r.cancel()
+	return r.Executor.Close()
+}
+
+func (r executorRunner) LookPath(ctx context.Context, name, dir string) (string, error) {
+	if err := r.ctx.Err(); err != nil {
+		return "", err
+	}
+	return r.Executor.LookPath(ctx, name, dir)
+}
+
+func TestLocalModelsOutliveTheWorkspaceBuiltLast(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(t.TempDir(), "llama-server")
+	require.NoError(t, os.WriteFile(binary, nil, 0o755))
+	cfg := defaultCfg()
+	mu, sched, drain := buildTestSchedulerForCfg(t, &cfg)
+	manager := workspace.NewManager(config.NopConfig(), sched)
+	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme, workspace.NewMemoryScheme))
+	require.NoError(t, manager.RegisterScheme(workspace.FileScheme, workspace.NewFileScheme))
+	uri, err := workspaceapi.ParseURI("file://" + dir)
+	require.NoError(t, err)
+	runner := FuncExtensionsRunner(func(
+		_ workspaceapi.URI, _ map[extensionapi.Permission]extension.ResourceRegistrar,
+		_, _ string, _ browser.Notifications, _, extExec schemeapi.Executor, _ extension.Grantor,
+		_ text.Editor, _ ideauthorizer.PromptOpener, _ storageapi.Service, _ func(func()) bool,
+	) (extension.Runner, error) {
+		ctx, cancel := context.WithCancel(context.Background())
+		return executorRunner{Executor: extExec, ctx: ctx, cancel: cancel}, nil
+	})
+	m := newTestWorkspaceManagerHandlerWithManagerMu(t, manager, mu, drain,
+		&uri, cfg, runner, nil, dir, nil, nopShutdownShaderConfig())
+	t.Cleanup(func() { _ = m.Close() })
+
+	m.mu.Lock()
+	err = m.commandCloseWorkspace()
+	m.mu.Unlock()
+	require.NoError(t, err)
+	m.closeWG.Wait()
+
+	got, err := m.localExecutor.LookPath(context.Background(), binary, "")
+	require.NoError(t, err, "local models must not use a closed workspace's executor")
+	assert.Equal(t, binary, got)
+}
+
+// newHUDTestIDE opens cwd, unless empty, in an IDE that reads configPath,
+// once it is installed.
+func newHUDTestIDE(t *testing.T, cwd, configPath string, opts ...Option) (*IDE, *sync.Mutex) {
+	t.Helper()
+	dataDir := t.TempDir()
+	mu := new(sync.Mutex)
+	sched, drain := newTestScheduler(t, mu)
+	opts = append([]Option{
+		WithLocker(mu),
+		WithScheduleNextTick(sched),
+		WithPublishEvent(func(term.Event) bool { return true }),
+	}, opts...)
+	i, err := New(cwd, configPath, dataDir, pkgtrust.NewStore(),
+		newTestStorage(t, dataDir), opts...)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = i.Close() })
+	_ = i.Ready()
+	drain()
+	i.WaitWorkspaces()
+	drain()
+	return i, mu
+}
+
+func writeHUDTestPNG(t *testing.T, path string, c color.Color) {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	img.Set(0, 0, c)
+	var buf bytes.Buffer
+	require.NoError(t, png.Encode(&buf, img))
+	require.NoError(t, os.WriteFile(path, buf.Bytes(), 0o644))
+}
+
+func TestLoadHUD(t *testing.T) {
+	ctx := context.Background()
+	tempDir := func(t *testing.T) string {
+		dir, err := filepath.EvalSymlinks(t.TempDir())
+		require.NoError(t, err)
+		return dir
+	}
+	writeConfig := func(t *testing.T, path, home, wm string) {
+		require.NoError(t, os.WriteFile(path, []byte("clipboard: memory\n"+
+			"workspace:\n  home: "+home+"\n"+
+			"browser:\n  window_manager:\n"+wm), 0o644))
+	}
+	topLeft := func(topLeft string) string {
+		return "    frame_charset:\n      topleft: \"" + topLeft + "\"\n"
+	}
+
+	t.Run("images are read again", func(t *testing.T) {
+		dir := tempDir(t)
+		imgPath := filepath.Join(dir, "tl.png")
+		uri := "file://" + imgPath
+		configPath := filepath.Join(dir, "rune.yaml")
+		writeConfig(t, configPath, dir,
+			"    frame_charset:\n      graphics:\n        topleft: "+uri+"\n")
+		writeHUDTestPNG(t, imgPath, color.White)
+		i, _ := newHUDTestIDE(t, "", configPath)
+		pixel := func(hud *HUD) color.Color {
+			require.Contains(t, hud.images, uri)
+			return color.NRGBAModel.Convert(hud.images[uri].At(0, 0))
+		}
+
+		first, err := i.LoadHUD(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, color.NRGBAModel.Convert(color.White), pixel(first))
+		assert.Empty(t, first.configErrs)
+
+		red := color.NRGBA{R: 255, A: 255}
+		writeHUDTestPNG(t, imgPath, red)
+		overwritten, err := i.LoadHUD(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, red, pixel(overwritten), "an image overwritten in place")
+		assert.Greater(t, overwritten.load, first.load)
+
+		require.NoError(t, os.Remove(imgPath))
+		missing, err := i.LoadHUD(ctx)
+		require.NoError(t, err)
+		assert.NotContains(t, missing.images, uri)
+	})
+
+	t.Run("status bar images are read again", func(t *testing.T) {
+		dir := tempDir(t)
+		imgPath := filepath.Join(dir, "ornament.png")
+		uri := "file://" + imgPath
+		configPath := filepath.Join(dir, "rune.yaml")
+		require.NoError(t, os.WriteFile(configPath, []byte("clipboard: memory\n"+
+			"workspace:\n  home: "+dir+"\n"+
+			"editor:\n  status_bar:\n    layout: '{{ .Status }}{{ .Image | src \""+uri+"\" }}'\n"),
+			0o644))
+		writeHUDTestPNG(t, imgPath, color.White)
+		i, _ := newHUDTestIDE(t, "", configPath)
+		pixel := func(hud *HUD) color.Color {
+			require.Contains(t, hud.statusBarImages, uri)
+			return color.NRGBAModel.Convert(hud.statusBarImages[uri].At(0, 0))
+		}
+
+		first, err := i.LoadHUD(ctx)
+		require.NoError(t, err)
+		assert.Empty(t, first.configErrs)
+		assert.Equal(t, color.NRGBAModel.Convert(color.White), pixel(first))
+		assert.NotContains(t, first.images, uri, "status bar images are cached apart")
+
+		red := color.NRGBA{R: 255, A: 255}
+		writeHUDTestPNG(t, imgPath, red)
+		overwritten, err := i.LoadHUD(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, red, pixel(overwritten), "an image overwritten in place")
+
+		require.NoError(t, os.Remove(imgPath))
+		missing, err := i.LoadHUD(ctx)
+		require.NoError(t, err)
+		assert.NotContains(t, missing.statusBarImages, uri)
+	})
+
+	t.Run("config errors", func(t *testing.T) {
+		dir := tempDir(t)
+		configPath := filepath.Join(dir, "rune.yaml")
+		writeConfig(t, configPath, dir, topLeft("╭"))
+		i, _ := newHUDTestIDE(t, "", configPath)
+
+		writeConfig(t, configPath, dir,
+			"    frame_charset:\n      graphics:\n        topleft: ftp://example.com/tl.png\n")
+		hud, err := i.LoadHUD(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, hud.configErrs, "window_manager.frame_charset")
+
+		require.NoError(t, os.WriteFile(configPath, []byte("browser: ["), 0o644))
+		hud, err = i.LoadHUD(ctx)
+		assert.Error(t, err)
+		assert.Nil(t, hud)
+	})
+
+	t.Run("a workspace config overlays the user's again", func(t *testing.T) {
+		home := tempDir(t)
+		ws := tempDir(t)
+		overlay := []byte("browser:\n  window_manager:\n    frame_attr:\n      fg: red\n")
+		require.NoError(t, os.WriteFile(filepath.Join(ws, ".iderc"), overlay, 0o644))
+		configPath := filepath.Join(home, "rune.yaml")
+		writeConfig(t, configPath, home, topLeft("╭"))
+		i, mu := newHUDTestIDE(t, ws, configPath, WithTrustedWorkspaceConfig(overlay))
+		mu.Lock()
+		w := i.workspaceHandler.workspaces[i.workspaceHandler.focus]
+		mu.Unlock()
+		require.NotNil(t, w)
+		assert.Equal(t, overlay, w.configOverlay)
+		uri := w.uri.String()
+
+		writeConfig(t, configPath, home, topLeft("╔"))
+		hud, err := i.LoadHUD(ctx)
+		require.NoError(t, err)
+		base := hud.base.browser.WindowManager
+		assert.Equal(t, '╔', base.FrameCharSet.TopLeft)
+		assert.NotEqual(t, term.ColorRed, base.FrameAttr.Fg)
+		require.Contains(t, hud.workspaces, uri)
+		layered := hud.workspaces[uri].browser.WindowManager
+		assert.Equal(t, '╔', layered.FrameCharSet.TopLeft)
+		assert.Equal(t, term.ColorRed, layered.FrameAttr.Fg)
+		assert.Empty(t, hud.skip)
+
+		mu.Lock()
+		w.configOverlay = []byte("browser: [")
+		mu.Unlock()
+		hud, err = i.LoadHUD(ctx)
+		require.NoError(t, err)
+		assert.NotContains(t, hud.workspaces, uri)
+		assert.Contains(t, hud.skip, uri, "an overlay that fails to decode")
+	})
+
+	t.Run("a workspace whose config is the user's", func(t *testing.T) {
+		dir := tempDir(t)
+		configPath := filepath.Join(dir, ".iderc")
+		writeConfig(t, configPath, dir, topLeft("╭"))
+		i, mu := newHUDTestIDE(t, dir, configPath)
+		mu.Lock()
+		w := i.workspaceHandler.workspaces[i.workspaceHandler.focus]
+		mu.Unlock()
+		require.NotNil(t, w)
+		assert.Nil(t, w.configOverlay, "the old contents would undo edits")
+
+		writeConfig(t, configPath, dir, topLeft("╔"))
+		hud, err := i.LoadHUD(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, '╔', hud.base.browser.WindowManager.FrameCharSet.TopLeft)
+		assert.Empty(t, hud.workspaces)
+		assert.Empty(t, hud.skip)
+	})
+}
+
+func TestWorkspaceNotificationsTakeItsConfig(t *testing.T) {
+	const width, height = 30, 6
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	ws, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	frame := filepath.Join(ws, "frame.png")
+	writeHUDTestPNG(t, frame, color.Gray{Y: 128})
+	overlay := []byte("notifications:\n  frame_charset:\n    topleft: \"╓\"\n" +
+		"    graphics:\n      topright: file://" + frame + "\n")
+	require.NoError(t, os.WriteFile(filepath.Join(ws, ".iderc"), overlay, 0o644))
+	configPath := filepath.Join(home, "rune.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte("clipboard: memory\n"+
+		"workspace:\n  home: "+home+"\n  wallpaper_ascii: wallpaper\n"+
+		"notifications:\n  progress_bar: false\n"+
+		// Indexing would post notifications of its own.
+		"search:\n  regex_enabled: false\n  semantic_enabled: false\n"), 0o644))
+	i, mu := newHUDTestIDE(t, ws, configPath, WithTrustedWorkspaceConfig(overlay))
+	mu.Lock()
+	defer mu.Unlock()
+	w := i.workspaceHandler.workspaces[i.workspaceHandler.focus]
+	require.NotNil(t, w)
+
+	for _, tt := range []struct {
+		name     string
+		ex       *ex
+		expected string
+	}{
+		{
+			name: "a workspace's notifications take its own config", ex: w.ex,
+			expected: `╓────────────────────────────a
+│hud                         │
+└────────────────────────────┘
+│         wallpaper          │
+│                            │
+└────────────────────────────┘`,
+		},
+		{
+			name: "the home workspace's notifications take the user's", ex: i.workspaceHandler.empty,
+			expected: `┌────────────────────────────┐
+│hud                         │
+└────────────────────────────┘
+│         wallpaper          │
+│                            │
+└────────────────────────────┘`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := tt.ex.container
+			c.Resize(width, height)
+			require.True(t, c.UpdateProgress(c.Notify(notifications.LevelInfo, "hud"), "", 1, 2))
+			awaitFrame(t, c, asciiart.NewStringWriter(width, height, asciiart.DefaultConfig()),
+				nil, tt.expected)
+		})
+	}
+}
+
+func TestNotificationGraphicsIntegration(t *testing.T) {
+	const width, height = 40, 8
+	interrupts := make(chan struct{}, 1)
+	newTestPublishOverride = func(term.Event) bool {
+		select {
+		case interrupts <- struct{}{}:
+		default:
+		}
+		return true
+	}
+	t.Cleanup(func() { newTestPublishOverride = nil })
+
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	uri := func(name string, y uint8) string {
+		path := filepath.Join(dir, name)
+		writeHUDTestPNG(t, path, color.Gray{Y: y})
+		return "file://" + path
+	}
+	frame, progress, reloaded := uri("frame.png", 128), uri("progress.png", 255), uri("reloaded.png", 40)
+	notificationsCfg := func(frame string) map[string]any {
+		return map[string]any{
+			"progress_bar": true,
+			"frame_charset": map[string]any{"graphics": map[string]any{
+				"topleft": frame, "topright": frame, "bottomleft": frame, "bottomright": frame,
+				"horizontaltop": frame, "horizontalbottom": frame,
+				"verticalleft": frame, "verticalright": frame,
+			}},
+			"progress_format": map[string]any{
+				"start": "{", "current": "-", "current_tip": ">", "remain": " ", "end": "}",
+				"graphics": map[string]any{"current": progress, "current_tip": progress},
+			},
+		}
+	}
+	cfg := defaultConfigWithWrap(false)
+	cfg.cfg["notifications"] = notificationsCfg(frame)
+	m := newTestWorkspaceManagerHandlerWithDir(t, cfg, dir, nopShutdownShaderConfig())
+	t.Cleanup(func() { _ = m.Close() })
+	// The workspace reads cfg in the background, so the reload swaps in a
+	// config of its own rather than editing cfg.
+	reloadedCfg := defaultConfigWithWrap(false)
+	reloadedCfg.cfg["notifications"] = notificationsCfg(reloaded)
+	var current atomic.Pointer[ideConfig]
+	current.Store(&cfg)
+	m.reloadConfig = func() (ideConfig, error) { return *current.Load(), nil }
+	wsURI, err := workspaceapi.ParseURI("file://" + dir)
+	require.NoError(t, err)
+	require.NoError(t, m.addOrCreateWorkspace(wsURI))
+	m.quiesce()
+
+	h := newSafeHandler(m)
+	h.Resize(width, height)
+	w := asciiart.NewStringWriter(width, height, asciiart.DefaultConfig())
+	notify := func(msg string) {
+		m.locked(func() {
+			c := m.workspaces[m.focus].ex.container
+			// Pinned, so the progress bar neither moves nor closes.
+			require.True(t, c.UpdateProgress(c.Notify(notifications.LevelInfo, msg), "", 4, 10))
+		})
+	}
+	draw := func() string {
+		require.NoError(t, w.Clear(term.Attributes{}))
+		h.Draw(w)
+		require.NoError(t, w.Flush())
+		return w.String()
+	}
+
+	notify("hud")
+	awaitFrame(t, h, w, interrupts, `┌────────────────────────aaaaaaaaaaaaaaa
+│                        a hud         a
+├────────────────────────{@@@@@@       }
+│          workspaceWallpaper          │
+│                                      │
+├──────────────────────────────────────┤
+│1 1  2 2                              │
+└─────━━━──────────────────────────────┘`)
+
+	current.Store(&reloadedCfg)
+	hud, err := m.loadHUD(context.Background())
+	require.NoError(t, err)
+	m.locked(func() { m.applyHUD(hud) })
+	assert.Equal(t, `┌────────────────────────_______________
+│                        _ hud         _
+├────────────────────────{@@@@@@       }
+│          workspaceWallpaper          │
+│                                      │
+├──────────────────────────────────────┤
+│1 1  2 2                              │
+└─────━━━──────────────────────────────┘`, draw(),
+		"the open notification draws the reloaded images at once")
+
+	notify("new")
+	// The workspace bar's frame covers the last column of the lower one.
+	assert.Equal(t, `┌────────────────────────_______________
+│                        _ new         _
+├────────────────────────{@@@@@@       }
+│          workspaceWallp_______________
+│                        _ hud         _
+├────────────────────────{@@@@@@       ┤
+│1 1  2 2                              │
+└─────━━━──────────────────────────────┘`, draw(),
+		"a notification posted afterwards draws the reloaded images")
+}
+
+// hudTestStyle is the HUD style of a config whose window frames start with
+// topLeft and whose frame union has top junctions.
+func hudTestStyle(topLeft, top string) hudStyle {
+	return ideConfig{cfg: map[string]any{"browser": map[string]any{
+		"window_manager": map[string]any{
+			"frame_charset": map[string]any{"topleft": topLeft},
+		},
+		"frameunion_charset": map[string]any{"top": top},
+	}}, errors: map[string]error{}}.hudStyle()
+}
+
+func TestApplyHUD(t *testing.T) {
+	cfg := defaultConfigWithWrap(false)
+	var soundsMu sync.Mutex
+	var played []string
+	cfg.sounds = sounds.PlayerFunc(func(name string) {
+		soundsMu.Lock()
+		defer soundsMu.Unlock()
+		played = append(played, name)
+	})
+	m, other := newActivityTestManager(t, cfg)
+	t.Cleanup(func() { _ = m.Close() })
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	focused, skipped := m.workspaces[m.focus], m.workspaces[other]
+	topLeft := func(e *ex) rune { return e.config.FrameCharSet.TopLeft }
+	bell := func(e *ex) string { return *e.emulatorConfig.BellSound.Load() }
+	untouched := topLeft(skipped.ex)
+	untouchedBell := bell(skipped.ex)
+	// A terminal opened before the reload holds a copy of the config.
+	openTerminal := focused.ex.emulatorConfig
+
+	base, overlaid := hudTestStyle("╭", "┳"), hudTestStyle("┏", "┳")
+	base.bellSound, overlaid.bellSound = "base-bell", "overlay-bell"
+	base.commandShowManual, overlaid.commandShowManual = true, true
+	base.notifyStatus = idestatus.NotifyConfig{
+		Sounds: map[programstatus.State]string{programstatus.Working: "tick"},
+	}
+	hud := &HUD{
+		load:       2,
+		base:       base,
+		workspaces: map[string]hudStyle{focused.uri.String(): overlaid},
+		skip:       map[string]struct{}{skipped.uri.String(): {}},
+	}
+	applied, _ := m.applyHUD(hud)
+	require.True(t, applied)
+	assert.Equal(t, '╭', topLeft(m.empty), "the home workspace gets the base style")
+	assert.Equal(t, '┏', topLeft(focused.ex), "a workspace gets its overlay's style")
+	assert.Equal(t, untouched, topLeft(skipped.ex), "a skipped workspace keeps its style")
+	assert.Equal(t, '┳', m.union.Top)
+	assert.Equal(t, "base-bell", bell(m.empty))
+	assert.Equal(t, "overlay-bell", bell(focused.ex))
+	assert.Equal(t, "overlay-bell", *openTerminal.BellSound.Load(),
+		"an open terminal rings the new bell")
+	assert.Equal(t, untouchedBell, bell(skipped.ex))
+	assert.True(t, m.empty.config.CommandOverlay.ShowManual)
+	assert.True(t, focused.ex.config.CommandOverlay.ShowManual)
+	assert.False(t, skipped.ex.config.CommandOverlay.ShowManual)
+
+	chat, err := workspaceapi.ParseURI("rune-agent://model/hud")
+	require.NoError(t, err)
+	_, err = focused.comp.Tab(chat, 'x', "hud", browsertest.NewTestHandler())
+	require.NoError(t, err)
+	require.NoError(t, focused.comp.SetTabStatus(chat,
+		programstatus.Report{State: programstatus.Working, Progress: -1}))
+	m.mu.Unlock()
+	m.quiesce()
+	m.mu.Lock()
+	soundsMu.Lock()
+	assert.Equal(t, []string{"tick"}, played, "program_status.sounds of the base config")
+	soundsMu.Unlock()
+
+	applied, _ = m.applyHUD(&HUD{load: 1, base: hudTestStyle("╔", "┯")})
+	assert.False(t, applied)
+	assert.Same(t, hud, m.hud, "an older HUD is ignored")
+	assert.Equal(t, '╭', topLeft(m.empty))
+	assert.Equal(t, '┳', m.union.Top)
+
+	skipped.configOverlay = []byte("browser: {}")
+	applied, _ = m.applyHUD(&HUD{load: 3, base: hudTestStyle("╔", "┯")})
+	assert.True(t, applied)
+	assert.Equal(t, '╔', topLeft(m.empty))
+	assert.Equal(t, '╔', topLeft(focused.ex))
+	assert.Equal(t, untouched, topLeft(skipped.ex),
+		"a workspace whose overlay the HUD did not read keeps its style")
+}
+
+// capturedServices is a registrar that keeps the services registered on it.
+type capturedServices map[string]any
+
+func (c capturedServices) RegisterService(desc *grpc.ServiceDesc, impl any) {
+	c[desc.ServiceName] = impl
+}
+
+func (c capturedServices) GetServiceInfo() map[string]grpc.ServiceInfo { return nil }
+
+// servedConfig returns the config res serves to an extension without an
+// ID.
+func servedConfig(t *testing.T, res extension.ResourceRegistrar) map[string]any {
+	t.Helper()
+	services := capturedServices{}
+	_, err := res.Register(services, new(sync.Mutex))
+	require.NoError(t, err)
+	server, ok := services[configrpc.Config_ServiceDesc.ServiceName].(configrpc.ConfigServer)
+	require.True(t, ok)
+	got, err := server.Get(context.Background(), &configrpc.GetRequest{})
+	require.NoError(t, err)
+	var cfg map[string]any
+	require.NoError(t, json.Unmarshal([]byte(got.GetData()), &cfg))
+	return cfg
+}
+
+func TestApplyHUDReloadsExtensionConfig(t *testing.T) {
+	var mu sync.Mutex
+	runners := map[string]*recordingRunner{}
+	configs := map[string]extension.ResourceRegistrar{}
+	runnerFn := func(
+		uri workspaceapi.URI,
+		res map[extensionapi.Permission]extension.ResourceRegistrar,
+		_, _ string, _ browser.Notifications,
+		_, _ schemeapi.Executor, _ extension.Grantor, _ text.Editor,
+		_ ideauthorizer.PromptOpener, _ storageapi.Service,
+		_ func(func()) bool) (extension.Runner, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		r := &recordingRunner{processes: 2}
+		runners[uri.String()] = r
+		configs[uri.String()] = res[extensionapi.PermissionConfig]
+		return r, nil
+	}
+	cfg := defaultConfigWithWrap(false)
+	dir := t.TempDir()
+	schedMu, sched, drain := buildTestSchedulerForCfg(t, &cfg)
+	manager := workspace.NewManager(config.NopConfig(), sched)
+	require.NoError(t, manager.RegisterScheme(workspace.MemoryScheme, workspace.NewMemoryScheme))
+	first, err := workspaceapi.ParseURI("memory://" + dir)
+	require.NoError(t, err)
+	m := newTestWorkspaceManagerHandlerWithManagerMu(t, manager, schedMu, drain,
+		&first, cfg, FuncExtensionsRunner(runnerFn), nil, dir, nil, nopShutdownShaderConfig())
+	t.Cleanup(func() { _ = m.Close() })
+	m.quiesce()
+	overlaid, err := workspaceapi.ParseURI("memory:///overlaid")
+	require.NoError(t, err)
+	skipped, err := workspaceapi.ParseURI("memory:///skipped")
+	require.NoError(t, err)
+	for _, uri := range []workspaceapi.URI{overlaid, skipped} {
+		require.NoError(t, m.addOrCreateWorkspace(uri))
+		m.quiesce()
+	}
+
+	m.mu.Lock()
+	_, signalled := m.applyHUD(&HUD{
+		load:          1,
+		base:          hudTestStyle("╭", "┳"),
+		cfg:           map[string]any{"marker": "base"},
+		workspaces:    map[string]hudStyle{overlaid.String(): hudTestStyle("┏", "┳")},
+		workspaceCfgs: map[string]map[string]any{overlaid.String(): {"marker": "overlay"}},
+		skip:          map[string]struct{}{skipped.String(): {}},
+	})
+	m.mu.Unlock()
+	assert.Equal(t, 4, signalled, "both processes of each workspace told")
+
+	mu.Lock()
+	defer mu.Unlock()
+	tests := []struct {
+		name        string
+		uri         workspaceapi.URI
+		wantMarker  any
+		wantReloads int
+	}{
+		{"a workspace with the user's config", first, "base", 1},
+		{"a workspace with its own config", overlaid, "overlay", 1},
+		{"a skipped workspace", skipped, nil, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Contains(t, runners, tt.uri.String())
+			assert.Equal(t, tt.wantReloads, runners[tt.uri.String()].reloadCount())
+			assert.Equal(t, tt.wantMarker, servedConfig(t, configs[tt.uri.String()])["marker"])
+		})
+	}
+}
+
+func TestInstallPendingWorkspaceAppliesNewerHUD(t *testing.T) {
+	cases := []struct {
+		name string
+		// loadsBeforeBuild is how many HUD loads had started when the
+		// build read the config.
+		loadsBeforeBuild uint64
+		want             rune
+	}{
+		{
+			name: "a HUD whose load started after the build read the config",
+			want: '┏',
+		},
+		{
+			name:             "a HUD the build read the config after",
+			loadsBeforeBuild: 1,
+			want:             thandler.DefaultWindowManagerConfig().FrameCharSet.TopLeft,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestWorkspaceManagerHandlerWithDir(t, defaultConfigWithWrap(false),
+				t.TempDir(), nopShutdownShaderConfig())
+			t.Cleanup(func() { _ = m.Close() })
+			m.hudLoads.Store(tc.loadsBeforeBuild)
+			m.mu.Lock()
+			m.hud = &HUD{load: 1, base: hudTestStyle("┏", "┳")}
+			m.mu.Unlock()
+
+			uri, err := workspaceapi.ParseURI("memory:///hud")
+			require.NoError(t, err)
+			require.NoError(t, m.addOrCreateWorkspace(uri))
+			m.quiesce()
+
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			slot, ok := m.findInstalledSlot(uri)
+			require.True(t, ok)
+			assert.Equal(t, tc.want, m.workspaces[slot].ex.config.FrameCharSet.TopLeft)
+		})
+	}
 }

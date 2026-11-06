@@ -29,8 +29,10 @@ import (
 	blueauth "github.com/unstablebuild/blue/auth"
 	"github.com/unstablebuild/rune-go-sdk/api/browserapi"
 	"github.com/unstablebuild/rune-go-sdk/api/extensionapi"
+	"github.com/unstablebuild/rune-go-sdk/api/searchapi"
 	"github.com/unstablebuild/rune-go-sdk/api/storageapi/storagestub"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
+	"github.com/unstablebuild/rune-go-sdk/component"
 	"github.com/unstablebuild/rune-go-sdk/handler"
 	"github.com/unstablebuild/rune-go-sdk/iterator"
 	"github.com/unstablebuild/rune-go-sdk/term"
@@ -127,6 +129,14 @@ func (e2eBrowser) Floating(
 	return browsertest.NopWindow(), nil
 }
 
+func (e2eBrowser) OpenPrompt(
+	browserapi.PromptConfig, handler.PromptHandler,
+) (browser.Window, bool, error) {
+	return browsertest.NopWindow(), true, nil
+}
+
+func (e2eBrowser) ButtonImages() *component.ButtonImages { return nil }
+
 func (e2eBrowser) Bar(browserapi.BarConfig, tui.Handler) error { return nil }
 
 func (e2eBrowser) SetTabName(workspaceapi.URI, string, term.Attributes) error { return nil }
@@ -192,10 +202,32 @@ func (s stubPackages) LibDir(context.Context, string) (iterator.Iterator[string]
 	return iterator.FromSlice(s.paths), nil
 }
 
+// stubSearcher is the workspace's searcher as seen by the search
+// service: it answers regexp searches with results, or fails with err.
+type stubSearcher struct {
+	results []searchapi.RegexpResult
+	err     error
+}
+
+func (s stubSearcher) RegexpSearch(context.Context, searchapi.RegexpRequest) (
+	iterator.Iterator[searchapi.RegexpResult], error,
+) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return iterator.FromSlice(s.results), nil
+}
+
+func (s stubSearcher) SemanticSearch(context.Context, searchapi.SemanticRequest) (
+	iterator.Iterator[searchapi.SemanticResult], searchapi.SemanticStatus, error,
+) {
+	return nil, searchapi.SemanticStatus{}, s.err
+}
+
 // dialExtensionWorkspace serves res through the runner, authorizer and
 // transport an extension process talks to, and returns the SDK
-// workspace such a process would get, so a test crosses every layer a
-// language extension's package lookup does.
+// workspace such a process would get, holding the permissions of res,
+// so a test crosses every layer an extension's call does.
 func dialExtensionWorkspace(
 	t *testing.T,
 	res map[extensionapi.Permission]extension.ResourceRegistrar,
@@ -241,13 +273,17 @@ func dialExtensionWorkspace(
 
 	signKey, err := baseRunner.keys.Sign(ctx)
 	require.NoError(t, err)
-	const extID = "packages-e2e-extension"
+	const extID = "resources-e2e-extension"
+	perms := extensionapi.Permissions{}
+	for perm := range res {
+		perms[perm] = nil
+	}
 	claims := ideauthorizer.Extension{
 		Metadata: extensionapi.Metadata{
 			DeveloperID:   "you",
 			ExtensionID:   extID,
 			ExtensionName: extID,
-			Permissions:   extensionapi.Permissions{extensionapi.PermissionPackages: nil},
+			Permissions:   perms,
 		},
 		Path: "/test/extension",
 	}

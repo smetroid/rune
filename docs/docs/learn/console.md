@@ -91,6 +91,7 @@ installed in the workspace, but the core commands are:
 | `logout` | Log out from the current session so you can login with a different account. |
 | `pkg <command> [<args>]` | Install and manage packages from Rune's official distribution. |
 | `models <command> [<args>]` | Inspect and manage LLM providers and local models. |
+| `search (<query...>\|status\|reindex)` | [Search the workspace's code](#searching-code-with-search) by meaning and by words, and inspect its search index. |
 | `agent <command> [<args>]` | Inspect and manage [Rune Agent](../agent/intro.md) models, chats, tools, skills, and configuration (available once the `rune-agent` package is installed). |
 | `debugger <subcommand> [...]` | Control a [debug session](./debugger.md) via the Debug Adapter Protocol. Start with `debugger initialize <langID>`, then `launch` or `attach`, then `configured`. |
 | `extensions (status\|info\|start\|stop\|restart\|logs) ...` | Manage workspace extensions. |
@@ -149,6 +150,21 @@ models providers openai add work    # store an OpenAI API key
 models providers codex login        # sign in to a ChatGPT subscription
 models local list                   # list locally cached models
 ```
+
+## Searching code with `search`
+
+The `search` command ranks the workspace's files by meaning and by words,
+best first. See [Workspace search](../agent/local-models.md#workspace-search)
+for what is indexed and how to turn on meaning search.
+
+| Command | What it does |
+| --- | --- |
+| `search <query...>` | List the best matches, each at its most relevant line. |
+| `search status` | Show the index: files by state, vectors and the model they were made with, and what the scan left out. |
+| `search reindex` | Rebuild the index from scratch. |
+
+To browse the matches with a preview instead, run
+[`searchsemantic`](./search.md#search-by-meaning) from the command prompt.
 
 ## Editing, history, and completion
 
@@ -275,7 +291,7 @@ changes, Rune asks you to renew the approval. See
 Workspace config decisions are listed as `persisted` when you chose **trust**,
 and as `transient` when you chose **trust once** or **ignore**, which last
 until you quit Rune. A workspace that is already open keeps the config it
-opened with: after revoking, run `:workspacereload` to be asked again right
+opened with: after revoking, run `workspacereload` to be asked again right
 away.
 
 ## See also

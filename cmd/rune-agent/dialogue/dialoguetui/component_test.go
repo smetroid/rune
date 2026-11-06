@@ -17,16 +17,27 @@
 package dialoguetui
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
+	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/unstablebuild/rune-go-sdk/api/storageapi/storagestub"
+	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
 	"github.com/unstablebuild/rune-go-sdk/component"
 	"github.com/unstablebuild/rune-go-sdk/component/comptest"
 	"github.com/unstablebuild/rune-go-sdk/term"
 	"github.com/unstablebuild/rune-go-sdk/tui"
+	"unstable.build/rune/internal/component/asciiart"
 	"unstable.build/rune/internal/component/markdown"
 )
 
@@ -34,6 +45,130 @@ var (
 	_ tui.Component        = (*Component)(nil)
 	_ component.Responsive = (*Component)(nil)
 )
+
+func TestComponentImageLifetime(t *testing.T) {
+	for _, dispose := range []string{"reset", "close"} {
+		t.Run(dispose, func(t *testing.T) {
+			var data bytes.Buffer
+			require.NoError(t, png.Encode(&data, image.NewRGBA(image.Rect(0, 0, 10, 240))))
+			cfg := DefaultMarkdownConfig()
+			cfg.FS = turnImageFS{"/images/picture.png": data.Bytes(), "images/picture.png": data.Bytes()}
+			cfg.Storage = storagestub.NewInMemoryService()
+			cfg.Interrupter = term.NopInterrupter()
+			comp := NewComponent(ComponentConfig{MarkdownConfig: cfg})
+			t.Cleanup(func() { require.NoError(t, comp.Close()) })
+			var previews []*markdown.Component
+			for _, id := range []string{"first", "second"} {
+				comp.AddToolCall(id, "capture", "", "")
+				comp.AddToolCallImage(id, "/images/picture.png", "preview")
+				previews = append(previews, comp.currentTurn.tools[id].images[0])
+				comp.AddReceiveMessage("![assistant](/images/picture.png)")
+			}
+			comp.eachTranscriptMarkdown(func(md *markdown.Component, _ term.Coordinates) {
+				previews = append(previews, md)
+			})
+			require.Len(t, previews, 4)
+			w := term.NewStringWriter(30, 20)
+			w.SetContext = term.ContextWithCellPixelSize(context.Background(), 10, 20)
+			for _, md := range previews {
+				require.Eventually(t, func() bool {
+					md.Resize(30, 20)
+					md.Draw(w)
+					return md.Height(30) > 10
+				}, time.Second, time.Millisecond, "replayed previews must load after answer breaks")
+			}
+			comp.AddReceiveMessage("later answer")
+			for _, md := range previews {
+				md.Draw(w)
+				assert.Greater(t, md.Height(30), 10)
+			}
+			if dispose == "reset" {
+				comp.Reset()
+			} else {
+				require.NoError(t, comp.Close())
+			}
+		})
+	}
+}
+
+type componentImageFS func(string, int, os.FileMode) (workspaceapi.File, error)
+
+func (fs componentImageFS) OpenFile(path string, flag int, mode os.FileMode) (workspaceapi.File, error) {
+	return fs(path, flag, mode)
+}
+
+func TestComponentImageLoadingAcrossBreak(t *testing.T) {
+	var data bytes.Buffer
+	require.NoError(t, png.Encode(&data, image.NewRGBA(image.Rect(0, 0, 10, 240))))
+	started, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(unblock)
+	cfg := DefaultMarkdownConfig()
+	cfg.FS = componentImageFS(func(path string, flag int, mode os.FileMode) (workspaceapi.File, error) {
+		close(started)
+		<-release
+		return (turnImageFS{"/images/picture.png": data.Bytes()}).OpenFile(path, flag, mode)
+	})
+	cfg.Storage = storagestub.NewInMemoryService()
+	cfg.Interrupter = term.NopInterrupter()
+	comp := NewComponent(ComponentConfig{MarkdownConfig: cfg})
+	t.Cleanup(func() { require.NoError(t, comp.Close()) })
+	comp.AddToolCall("image", "capture", "", "")
+	comp.AddToolCallImage("image", "/images/picture.png", "preview")
+	turn := comp.currentTurn
+	w := term.NewStringWriter(30, 20)
+	w.SetContext = term.ContextWithCellPixelSize(context.Background(), 10, 20)
+	turn.Resize(30, 20)
+	turn.Draw(w)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("image load did not start")
+	}
+	comp.AddReceiveMessage("answer")
+	comp.AddReceiveMessage("later answer")
+	unblock()
+	require.Eventually(t, func() bool {
+		turn.Resize(30, 20)
+		turn.Draw(w)
+		return turn.tools["image"].images[0].Height(30) == 14
+	}, time.Second, time.Millisecond)
+}
+
+func TestComponentDisposesDeferredImages(t *testing.T) {
+	for _, dispose := range []string{"reset", "close"} {
+		t.Run(dispose, func(t *testing.T) {
+			var data bytes.Buffer
+			require.NoError(t, png.Encode(&data, image.NewRGBA(image.Rect(0, 0, 10, 240))))
+			cfg := DefaultMarkdownConfig()
+			cfg.FS = turnImageFS{"/images/picture.png": data.Bytes(), "images/picture.png": data.Bytes()}
+			cfg.Storage = storagestub.NewInMemoryService()
+			cfg.Interrupter = term.NopInterrupter()
+			comp := NewComponent(ComponentConfig{MarkdownConfig: cfg})
+			t.Cleanup(func() { require.NoError(t, comp.Close()) })
+			comp.AddToolCall("image", "capture", "", "")
+			comp.AddToolCallImage("image", "/images/picture.png", "preview")
+			preview := comp.currentTurn.tools["image"].images[0]
+			comp.AddReceiveMessageChunk("![assistant](/images/picture.png)")
+			assistant := comp.tailMd
+			if dispose == "reset" {
+				comp.Reset()
+			} else {
+				require.NoError(t, comp.Close())
+			}
+			w := term.NewStringWriter(30, 20)
+			w.SetContext = term.ContextWithCellPixelSize(context.Background(), 10, 20)
+			for _, md := range []*markdown.Component{preview, assistant} {
+				for deadline := time.Now().Add(100 * time.Millisecond); time.Now().Before(deadline); {
+					md.Resize(30, 20)
+					md.Draw(w)
+					require.LessOrEqual(t, md.Height(30), 10, "disposed images must not start loading")
+					time.Sleep(time.Millisecond)
+				}
+			}
+		})
+	}
+}
 
 func TestComponentDraw(t *testing.T) {
 	for i := range 2 {
@@ -4642,4 +4777,139 @@ func TestComponentScrollToPinnedMessage(t *testing.T) {
 			strings.TrimRight(rows[2], " "), strings.TrimRight(rows[3], " "),
 		})
 	assert.False(t, comp.PinnedMessageAt(term.Coordinates{X: 0, Y: 0}))
+}
+
+func TestComponentSetStatusBarConfig(t *testing.T) {
+	const width, height = 40, 12
+	modelOnly, err := ParseStatusBarLayout(`{{ .Model }}`)
+	require.NoError(t, err)
+	withEffort, err := ParseStatusBarLayout(`{{ .Model }} {{ .Effort }}`)
+	require.NoError(t, err)
+	start := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	enabled := func(layout []StatusBarComponent, shader string) StatusBarConfig {
+		return StatusBarConfig{Enabled: true, Layout: layout, Shader: shader}
+	}
+	tests := []struct {
+		name string
+		from StatusBarConfig
+		// whileSet changes the state between the two configs.
+		whileSet     func(*StatusBarState)
+		to           StatusBarConfig
+		wantBar      int
+		wantEffect   bool
+		wantModel    string
+		wantRendered string
+	}{
+		{
+			name: "a new layout", from: enabled(modelOnly, ""), to: enabled(withEffort, ""),
+			wantBar: 1, wantModel: "opus", wantRendered: "opus high",
+		},
+		{
+			name: "turning the bar off", from: enabled(modelOnly, ""), to: StatusBarConfig{},
+			wantBar: 0,
+		},
+		{
+			name: "turning the bar back on", from: StatusBarConfig{},
+			whileSet: func(s *StatusBarState) { s.Model = "sonnet" },
+			to:       enabled(modelOnly, ""), wantBar: 1, wantModel: "sonnet", wantRendered: "sonnet",
+		},
+		{
+			name: "an effect during a turn", from: enabled(modelOnly, ""), to: enabled(modelOnly, "pulse"),
+			wantBar: 1, wantEffect: true, wantModel: "opus", wantRendered: "opus",
+		},
+		{
+			name: "an effect removed during a turn", from: enabled(modelOnly, "pulse"), to: enabled(modelOnly, ""),
+			wantBar: 1, wantModel: "opus", wantRendered: "opus",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			comp := NewComponent(ComponentConfig{StatusBar: tt.from})
+			h, tx, _ := Handler(context.Background(), new(sync.Mutex), comp, make(interrupts, 1))
+			t.Cleanup(func() {
+				close(tx)
+				assert.NoError(t, comp.Close())
+			})
+			h.Resize(width, height)
+			comp.SetStatusBarState(func(s *StatusBarState) {
+				s.Active, s.TurnStart, s.Model, s.Effort = true, start, "opus", "high"
+			})
+			if tt.whileSet != nil {
+				comp.SetStatusBarState(tt.whileSet)
+			}
+
+			comp.SetStatusBarConfig(tt.to)
+			assert.Equal(t, tt.wantBar, comp.barHeight())
+			boxH := comp.boxHeight(comp.boxWidth(width))
+			assert.Equal(t, height-tt.wantBar, comp.InputPosition().Y+boxH,
+				"the compose box sits right above the bar")
+			if tt.wantBar == 0 {
+				assert.Zero(t, comp.StatusBarState())
+				return
+			}
+			state := comp.StatusBarState()
+			assert.Equal(t, tt.wantModel, state.Model)
+			assert.True(t, state.Active)
+			assert.Equal(t, start, state.TurnStart, "the turn keeps its elapsed time")
+			assert.Equal(t, tt.wantEffect, comp.shadedBar.shader != nil)
+			assert.Equal(t, tt.wantRendered, strings.TrimSpace(render(t, comp.statusBar, width)))
+		})
+	}
+}
+
+func TestComponentInputBoxFrameGraphics(t *testing.T) {
+	const width, height = 24, 4
+	// Nothing is on disk at uri, so only a reloaded image can draw.
+	const uri = "file:///nonexistent/frame.png"
+	cs := component.FrameCharSetDefault()
+	cs.TopLeft = '╓'
+	cs.Graphics = component.FrameCharSetGraphics{TopLeft: uri, Overlay: true}
+	// The asciiart writer draws the gray 128 pixel as 'a'.
+	gray := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	gray.Set(0, 0, color.Gray{Y: 128})
+
+	tests := []struct {
+		name      string
+		noStorage bool
+		expected  string
+	}{
+		{
+			name: "a reloaded image draws over the frame",
+			expected: "                        \n" +
+				"  a──────────────────┐  \n" +
+				"  │                  │  \n" +
+				"  └──────────────────┘  ",
+		},
+		{
+			name:      "without storage the frame shows its runes alone",
+			noStorage: true,
+			expected: "                        \n" +
+				"  ╓──────────────────┐  \n" +
+				"  │                  │  \n" +
+				"  └──────────────────┘  ",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := ComponentConfig{InputBox: InputBoxConfig{
+				GraphicsStorage: storagestub.NewInMemoryService(),
+			}}
+			if tt.noStorage {
+				cfg.InputBox.GraphicsStorage = nil
+			}
+			comp := NewComponent(cfg)
+			t.Cleanup(func() { assert.NoError(t, comp.Close()) })
+			h, tx, _ := Handler(context.Background(), new(sync.Mutex), comp, term.NopInterrupter())
+			defer close(tx)
+			h.Resize(width, height)
+
+			comp.SetInputBoxFrameCharSet(cs, nil)
+			h.Draw(term.NewStringWriter(width, height))
+			comp.SetInputBoxFrameCharSet(cs, map[string]image.Image{uri: gray})
+			w := asciiart.NewStringWriter(width, height, asciiart.DefaultConfig())
+			h.Draw(w)
+			require.NoError(t, w.Flush())
+			assert.Equal(t, tt.expected, w.String())
+		})
+	}
 }

@@ -43,6 +43,7 @@ import (
 	"unstable.build/rune/internal/component/shader"
 	"unstable.build/rune/internal/debug"
 	thandler "unstable.build/rune/internal/handler"
+	hmarkdown "unstable.build/rune/internal/handler/markdown"
 	"unstable.build/rune/internal/term/programstatus"
 )
 
@@ -104,7 +105,6 @@ type Component struct {
 	prompts     map[string]Window
 	drag        dragState
 	winDrop     winDropState
-	interrupter term.Interrupter
 	// spinner ticks while at least one tab is working so Draw can cycle
 	// the working tabs' icons.
 	spinner *statusSpinner
@@ -181,26 +181,14 @@ func (c *Component) Init(config Config) {
 	c.wm.Subscribe((*wmSubscriber)(c))
 	c.buffers = make([]*Tab, 0)
 
-	frameAttr := config.WindowManagerConfig.FrameAttr
-	highlightAttr := config.FocusTabHighlightAttr
-	frameAttr.Attrs |= term.AttrNegativeVerticalRenderOffset
-	bgAttr := term.Attributes{Bg: frameAttr.Bg}
-	focusTabAttr := config.FocusTabAttr
-	focusTabAttr.Attrs |= term.AttrNegativeVerticalRenderOffset
-	nonFocusTabAttr := config.NonFocusTabAttr
-	nonFocusTabAttr.Attrs |= term.AttrNegativeVerticalRenderOffset
-	c.tabs.SetAttr(focusTabAttr, nonFocusTabAttr,
-		c.focusTabIconAttr(), c.nonFocusTabIconAttr(),
-		highlightAttr, frameAttr, bgAttr)
-	c.tabs.SetFrameCharSet(config.WindowManagerConfig.FrameCharSet)
-	c.tabs.SetFocusFrameChar(config.FocusTabHighlightChar)
+	c.styleTabs()
 	c.shadedTabs = thandler.NewShadedTabs(&c.tabs, thandler.ShadedTabsConfig{
 		Shader:      config.ActiveTabShader,
 		FPS:         config.ActiveTabShaderFPS,
 		Loop:        config.ActiveTabShaderLoop,
 		Params:      config.ActiveTabShaderParams,
 		DefAttr:     config.NonFocusTabAttr,
-		Interrupter: c.interrupter,
+		Interrupter: config.Interrupter,
 		Active:      c.activeTabIndices,
 	})
 
@@ -209,6 +197,46 @@ func (c *Component) Init(config Config) {
 	if config.TabNameSeparator != "" {
 		c.tabs.SetNameSeparator(config.TabNameSeparator)
 	}
+}
+
+func (c *Component) styleTabs() {
+	frameAttr := c.config.WindowManagerConfig.FrameAttr
+	frameAttr.Attrs |= term.AttrNegativeVerticalRenderOffset
+	bgAttr := term.Attributes{Bg: frameAttr.Bg}
+	focusTabAttr := c.config.FocusTabAttr
+	focusTabAttr.Attrs |= term.AttrNegativeVerticalRenderOffset
+	nonFocusTabAttr := c.config.NonFocusTabAttr
+	nonFocusTabAttr.Attrs |= term.AttrNegativeVerticalRenderOffset
+	c.tabs.SetAttr(focusTabAttr, nonFocusTabAttr,
+		c.focusTabIconAttr(), c.nonFocusTabIconAttr(),
+		c.config.FocusTabHighlightAttr, frameAttr, bgAttr)
+	c.tabs.SetFrameCharSet(c.config.WindowManagerConfig.FrameCharSet)
+	c.tabs.SetFocusFrameChar(c.config.FocusTabHighlightChar)
+}
+
+// Restyle draws c with s from the next Draw on: its windows, frame union
+// and tab bar, the prompts it opens later, and the wallpaper of every
+// window showing it. Prompts already open keep their style.
+func (c *Component) Restyle(s Style) {
+	c.config = c.config.Restyled(s)
+	c.wm.Restyle(c.config.WindowManagerConfig)
+	c.union.Attributes = c.config.WindowManagerConfig.FrameAttr
+	c.union.Right = c.config.FrameUnionCharSet.Right
+	c.union.Left = c.config.FrameUnionCharSet.Left
+	c.union.Top = c.config.FrameUnionCharSet.Top
+	c.union.Bottom = c.config.FrameUnionCharSet.Bottom
+	c.styleTabs()
+	for _, bw := range c.windows {
+		if isWallpaper(bw.win.Content().(browserapi.Handler)) {
+			c.updateWindowContent(bw, c.wallpaper(), nil)
+		}
+	}
+}
+
+// FrameGraphics returns the images that c's frames and prompt buttons
+// are drawn with. It is nil when the window manager draws no images.
+func (c *Component) FrameGraphics() *tcomponent.FrameGraphics {
+	return c.wm.FrameGraphics()
 }
 
 // initUnion builds the frame union from scratch. The union only ever
@@ -646,14 +674,14 @@ func (c *Component) setSpinnerRunning(running bool) {
 		c.spinner = nil
 		return
 	}
-	if c.interrupter == nil || len(c.config.TabStatus.Spinner) == 0 {
+	if c.config.Interrupter == nil || len(c.config.TabStatus.Spinner) == 0 {
 		return
 	}
 	fps := c.config.TabStatus.SpinnerFPS
 	if fps <= 0 {
 		fps = DefaultTabStatusConfig().SpinnerFPS
 	}
-	c.spinner = newStatusSpinner(c.interrupter, fps)
+	c.spinner = newStatusSpinner(c.config.Interrupter, fps)
 }
 
 // drawSpinner moves the icons of working tabs to the current frame.
@@ -1469,68 +1497,46 @@ func (c *Component) Selection() (string, bool) {
 	return c.union.Selection()
 }
 
-// Prompt creates a new prompt to be drawn as an overlay on the next call to Draw
-// and it also takes over event control until user either exits prompt or selects
-// an option. The passed options and bindings must be equal in length, or bindings
-// must be zero in length, meaning no key bindings are provided to user.
-// Callers must ensure that there's coherence between options and bindings, otherwise
-// this method panics.
+// Prompt opens a floating window centered over this Component that asks
+// cfg.Message, rendered as markdown, and takes over events until the
+// user picks an option or closes the window, which promptHandler is
+// told as browserapi.Prompter describes. The prompt is styled with
+// Config.PromptConfig. It panics when cfg.Validate fails.
 //
-// Prompt uses message to de-duplicate prompts. If a prompt is already open
-// then this method returns the window used to display that prompt.
+// Prompt uses cfg.Message to de-duplicate prompts: while a prompt with
+// the same message is open, it returns that prompt's window and
+// promptHandler is never called.
 func (c *Component) Prompt(
-	message string, options []string,
-	bindings []term.KeyComb,
-	promptHandler handler.PromptHandler,
+	cfg browserapi.PromptConfig, promptHandler handler.PromptHandler,
 ) Window {
-	if len(options) == 0 || (len(bindings) != 0 && len(options) != len(bindings)) {
-		panic("Prompt given invalid options and/or bindings")
+	if err := cfg.Validate(); err != nil {
+		panic(fmt.Sprintf("Prompt given an invalid config: %s", err))
 	}
-	if win, ok := c.prompts[message]; ok {
+	if win, ok := c.prompts[cfg.Message]; ok {
 		return win
 	}
 	clearHandler := &clearOnClosePromptHandler{
 		root:    promptHandler,
 		c:       c,
-		message: message,
+		message: cfg.Message,
 	}
+	style := c.config.PromptConfig
 	promptConfig := handler.PromptConfig{
 		PromptConfig: component.PromptConfig{
-			Message:              message,
-			Options:              options,
-			BackgroundAttributes: c.config.PromptConfig.BackgroundAttr,
-			MinWidth:             c.config.PromptConfig.MinWidth,
+			Message:              cfg.Message,
+			Options:              cfg.Options,
+			BackgroundAttributes: style.BackgroundAttr,
+			MinWidth:             style.MinWidth,
 			NewMessage: func(str string) component.Floating {
-				mcfg := markdown.DefaultConfig()
-				mcfg.HeaderPrefix = false
-				mkd, err := markdown.NewWithConfig(str, mcfg)
-				if err == nil {
-					return component.NewAspectRatioFloatingResponsive(
-						component.NewSpan(mkd, component.SpanConfig{
-							PadHorizontal:    4,
-							PadVertical:      2,
-							ContentAlignment: component.AlignmentCentered,
-						}), component.DefaultAspectRatio)
-				}
-				cfg := component.StringResponsiveConfig{
-					NoSplitWords: true,
-					StringConfig: component.StringConfig{
-						PaddingVertical:   4,
-						PaddingHorizontal: 4,
-						Alignment:         component.AlignmentCentered,
-					},
-				}
-				messageResponsive := component.NewResponsiveString(str, cfg)
-
-				return component.NewAspectRatioFloatingResponsive(
-					messageResponsive, component.DefaultAspectRatio)
+				return c.promptMessage(str, cfg.MaxWidth)
 			},
+			ButtonImages: c.ButtonImages(),
 		},
 		PromptHandler:  clearHandler,
-		OptionBindings: bindings,
-		OptionAttr:     c.config.PromptConfig.TextAttr,
-		HighlightAttr:  c.config.PromptConfig.HighlightAttr,
-		ClickedAttr:    c.config.PromptConfig.ClickedAttr,
+		OptionBindings: cfg.Bindings,
+		OptionAttr:     style.TextAttr,
+		HighlightAttr:  style.HighlightAttr,
+		ClickedAttr:    style.ClickedAttr,
 	}
 
 	prompt := handler.NewPrompt(promptConfig)
@@ -1540,8 +1546,106 @@ func (c *Component) Prompt(
 
 	win := c.Floating(prompt, floatingConfig)
 	clearHandler.win = win
-	c.prompts[message] = win
+	c.prompts[cfg.Message] = win
 	return win
+}
+
+// OpenPrompt satisfies Prompter.
+func (c *Component) OpenPrompt(
+	cfg browserapi.PromptConfig, h handler.PromptHandler,
+) (Window, bool, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, false, err
+	}
+	if win, ok := c.prompts[cfg.Message]; ok {
+		return win, false, nil
+	}
+	return c.Prompt(cfg, h), true, nil
+}
+
+// promptMessage renders the message of a prompt, as markdown when it
+// parses, whose links open with PromptConfig.OnLinkClick. See
+// browserapi.PromptConfig.MaxWidth for its size.
+func (c *Component) promptMessage(str string, maxWidth int) component.Floating {
+	mcfg := markdown.DefaultConfig()
+	mcfg.HeaderPrefix = false
+	mcfg.Parser = c.config.PromptConfig.Parser
+	if c.config.PromptConfig.ScheduleNextTick != nil {
+		mcfg.ScheduleNextTick = c.config.PromptConfig.ScheduleNextTick
+	}
+	mkd, err := markdown.NewWithConfig(str, mcfg)
+	if err != nil {
+		msg := component.NewAspectRatioFloatingResponsive(
+			component.NewResponsiveString(str, component.StringResponsiveConfig{
+				NoSplitWords: true,
+				StringConfig: component.StringConfig{
+					PaddingVertical:   4,
+					PaddingHorizontal: 4,
+					Alignment:         component.AlignmentCentered,
+				},
+			}), component.DefaultAspectRatio)
+		if maxWidth == 0 {
+			return msg
+		}
+		return &maxWidthFloating{floatingResponsive: msg, maxWidth: maxWidth}
+	}
+	md := handler.NewSpan(
+		hmarkdown.New(mkd, hmarkdown.WithOnLinkClick(c.config.PromptConfig.OnLinkClick)),
+		component.SpanConfig{
+			PadHorizontal:    4,
+			PadVertical:      2,
+			ContentAlignment: component.AlignmentCentered,
+		})
+	var size component.Floating = component.NewAspectRatioFloatingResponsive(
+		md, component.DefaultAspectRatio)
+	if maxWidth > 0 {
+		// a Span is as wide as its widest line
+		size = &maxWidthFloating{floatingResponsive: md, maxWidth: maxWidth}
+	}
+	return &markdownMessage{Span: md, size: size}
+}
+
+type floatingResponsive interface {
+	component.Floating
+	component.Responsive
+}
+
+// markdownMessage is a prompt's markdown message, sized by size. The
+// sizes wrap the Span themselves, which would hide the Handle that the
+// prompt passes the mouse events on the message to.
+type markdownMessage struct {
+	*handler.Span
+	size component.Floating
+}
+
+// Dimensions satisfies component.Floating.
+func (m *markdownMessage) Dimensions() (width, height int) {
+	return m.size.Dimensions()
+}
+
+// maxWidthFloating sizes a message no wider than maxWidth, wrapping it
+// at that width when it would be wider.
+type maxWidthFloating struct {
+	floatingResponsive
+	maxWidth int
+}
+
+// Dimensions satisfies component.Floating.
+func (f *maxWidthFloating) Dimensions() (width, height int) {
+	width, height = f.floatingResponsive.Dimensions()
+	if width <= f.maxWidth {
+		return width, height
+	}
+	return f.maxWidth, f.Height(f.maxWidth)
+}
+
+// ButtonImages returns the images under the buttons of the prompts this
+// Component opens, as Config.PromptConfig.Images names them, for buttons
+// drawn elsewhere to match. It is nil when no image is named or the
+// window manager draws no images, which is without
+// WindowManagerConfig.FrameGraphicsStorage or Interrupter.
+func (c *Component) ButtonImages() *component.ButtonImages {
+	return c.config.PromptConfig.Images.ButtonImages(c.wm.FrameGraphics())
 }
 
 // Subscribe subscribes sub to window focus events.
@@ -1651,6 +1755,9 @@ func (c *Component) Close() (ret error) {
 		}
 		_ = bw.Close()
 	})
+	if err := c.wm.Close(); err != nil {
+		ret = err
+	}
 	return ret
 }
 
@@ -1992,7 +2099,9 @@ func (c *Component) findWindow(winID uint64) (*browserWindow, bool) {
 }
 
 func (c *Component) overwriteFocusWindowUnion(w term.Writer) {
-	if !c.config.Frame || c.focusWindow == (thandler.Window{}) || c.wm.SizeTiles() == 1 {
+	// Without union junctions, the window manager drew these corners
+	// already, along with any frame images that rewriting them would hide.
+	if !c.union.Frame || c.focusWindow == (thandler.Window{}) || c.wm.SizeTiles() == 1 {
 		return
 	}
 	topleft := c.focusWindow.Position()
@@ -2485,17 +2594,6 @@ func (c *Component) winDropVeil() (win *browserWindow, label string, ok bool) {
 	}
 }
 
-// SetInterrupter installs the interrupter used to animate the
-// drop-target veil. Without one the veil is still drawn, but only
-// repaints when the host redraws for another reason.
-func (c *Component) SetInterrupter(i term.Interrupter) {
-	c.interrupter = i
-	c.shadedTabs.SetInterrupter(i)
-	working := c.HasWorkingTabs()
-	c.shadedTabs.SetRunning(working)
-	c.setSpinnerRunning(working)
-}
-
 // WindowAt returns the window rendered at pos, which is relative to
 // this Component's top-left corner.
 func (c *Component) WindowAt(pos term.Coordinates) (Window, bool) {
@@ -2573,12 +2671,12 @@ func (c *Component) DragDrop(pos term.Coordinates, paths []string) bool {
 // startVeil starts the shared pulse ticker used by both the file-drop
 // veil and the window-drag preview veil.
 func (c *Component) startVeil() {
-	if c.interrupter == nil || c.drag.cancel != nil {
+	if c.config.Interrupter == nil || c.drag.cancel != nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c.drag.cancel = cancel
-	interrupter := c.interrupter
+	interrupter := c.config.Interrupter
 	frame := &c.drag.frame
 	go debug.CapturePanicReport(func() {
 		ticker := time.NewTicker(time.Second / dragVeilFPS)
@@ -2608,10 +2706,10 @@ func (c *Component) stopVeil() {
 }
 
 func (c *Component) interrupt() {
-	if c.interrupter == nil {
+	if c.config.Interrupter == nil {
 		return
 	}
-	_ = c.interrupter.Interrupt(context.Background())
+	_ = c.config.Interrupter.Interrupt(context.Background())
 }
 
 // drawDragVeil renders the browser with a pulsing veil over the file

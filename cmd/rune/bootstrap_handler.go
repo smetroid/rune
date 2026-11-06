@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -34,6 +35,7 @@ import (
 	"github.com/unstablebuild/rune-go-sdk/api/browserapi"
 	"github.com/unstablebuild/rune-go-sdk/api/config"
 	"github.com/unstablebuild/rune-go-sdk/api/storageapi"
+	"github.com/unstablebuild/rune-go-sdk/api/textapi"
 	"github.com/unstablebuild/rune-go-sdk/api/workspaceapi"
 	"github.com/unstablebuild/rune-go-sdk/clipboard"
 	"github.com/unstablebuild/rune-go-sdk/component"
@@ -43,18 +45,23 @@ import (
 	"unstable.build/rune/cmd/rune/ide/apiclient"
 	"unstable.build/rune/internal/browser"
 	"unstable.build/rune/internal/debug"
+	"unstable.build/rune/internal/handler/quickmenu"
 	"unstable.build/rune/internal/ide"
 	"unstable.build/rune/internal/ide/hostenv"
 	"unstable.build/rune/internal/ide/idepkg"
 	"unstable.build/rune/internal/ide/idepkg/pkgtrust"
 	"unstable.build/rune/internal/ide/ideupgrade"
 	"unstable.build/rune/internal/ide/keymeta"
+	"unstable.build/rune/internal/sounds"
 	"unstable.build/rune/internal/term/gui"
 	"unstable.build/rune/internal/term/gui/appmenu"
 	"unstable.build/rune/internal/term/gui/glassbar"
 	"unstable.build/rune/internal/term/gui/openpanel"
+	"unstable.build/rune/internal/text"
 	"unstable.build/rune/internal/workspace"
 )
+
+const cmdThemeReload = "themereload"
 
 type bootstrapPrompter interface {
 	Prompt(message string, options []string, bindings []term.KeyComb, h sdkhandler.PromptHandler) browser.Window
@@ -103,13 +110,26 @@ type bootstrapHandler struct {
 	goos          string
 	closingPreIDE bool
 	recent        *recentWorkspaces
-	// quickMenu is the configured native quick menu. It is parsed once
-	// per config load because the reserved grid column it implies is
-	// fixed at ide.New time.
+	// quickMenu is the configured quick menu. It is read before ide.New,
+	// which takes the grid column it reserves, and again by every HUD
+	// reload.
 	quickMenu []ide.QuickMenuButton
+	// quickMenuSounds are the sounds quickMenuBar plays.
+	quickMenuSounds quickmenu.Sounds
+	// quickMenuBar draws quickMenu in place of the native bar when its
+	// buttons have sprites, and is nil otherwise.
+	quickMenuBar *quickmenu.Bar
 	// quickMenuOff is set while the user has toggled the bar off with
 	// the quickmenu command.
 	quickMenuOff bool
+	// soundVolume and defaultTheme are the gui.sound_volume and
+	// gui.default_theme last read from the config. A HUD reload applies
+	// them only when they change, so it keeps a volume or theme the user
+	// picked since.
+	soundVolume  float64
+	defaultTheme string
+	// afterFunc runs f after d, off the event loop.
+	afterFunc func(d time.Duration, f func())
 }
 
 func newBootstrapHandler(
@@ -145,9 +165,14 @@ func newBootstrapHandler(
 		clip:             clip,
 		soundOutput:      soundOutput,
 		installBackupDir: installBackupDir,
+		afterFunc: func(d time.Duration, f func()) {
+			time.AfterFunc(d, func() { debug.CapturePanicReport(f) })
+		},
 	}
 	bh.recent = newRecentWorkspaces(bh.storage)
-	bh.loadQuickMenu()
+	bh.quickMenu, bh.quickMenuSounds = readQuickMenu(configPath)
+	bh.quickMenuBar = newQuickMenuBar(bh.quickMenu, bh.quickMenuSounds, nil, bh.storage,
+		publishEvent, sounds.PlayerFunc(bh.playSound), bh.activateQuickMenuButton)
 	bh.rootCfg = rootCfg
 
 	if isBootstrapped(dataDir) {
@@ -308,20 +333,6 @@ func (b *bootstrapHandler) attachGUI(g *gui.GUI, transparentWindow bool) {
 	b.publishQuickMenuInstall()
 }
 
-// loadQuickMenu re-reads the configured quick menu. It loads the config
-// standalone because the reserved grid column must be known before
-// ide.New, and again after the bootstrap wizard writes the user config.
-// A validation error still yields a usable tree with the offending
-// entries neutralised, and the IDE reports it to the user, so the valid
-// buttons are kept rather than dropping the whole bar.
-func (b *bootstrapHandler) loadQuickMenu() {
-	cfg, err := ide.Config(b.configPath, runeDefaultConfig())
-	if err != nil {
-		log.Warnf("load config for quick menu: %v", err)
-	}
-	b.quickMenu = ide.QuickMenuButtons(cfg)
-}
-
 // setupPreIDE registers the GUI command family on the pre-config IDE
 // that is active during first-run bootstrap, so that commands such as
 // guifontsize resolve instead of failing with "unknown command". The
@@ -469,19 +480,24 @@ func (b *bootstrapHandler) guiThemesLiveApplyHook(
 	if !ok {
 		return idepkg.ConfigMergeResult{}, nil
 	}
-	scheduled := b.scheduleNextTick(func() {
-		themes := getGUIColorThemes(b.browser(), guiCfg)
-		if theme, reapplied := b.g.SetColorThemes(themes); reapplied {
-			b.currentIDE().SetDefaultAttributes(term.Attributes{
-				Fg: term.FromTcellColor(theme.Foreground),
-				Bg: term.FromTcellColor(theme.Background),
-			})
-		}
-	})
+	scheduled := b.scheduleNextTick(func() { b.applyGUIThemes(guiCfg) })
 	if !scheduled {
 		return idepkg.ConfigMergeResult{}, nil
 	}
 	return idepkg.ConfigMergeResult{LivePaths: [][]string{{"gui", "themes"}}}, nil
+}
+
+// applyGUIThemes makes the themes of guiCfg the ones the GUI offers,
+// repainting with the active one when guiCfg redefines it. It must run
+// on the event loop.
+func (b *bootstrapHandler) applyGUIThemes(guiCfg config.Config) {
+	themes := getGUIColorThemes(b.browser(), guiCfg)
+	if theme, reapplied := b.g.SetColorThemes(themes); reapplied {
+		b.currentIDE().SetDefaultAttributes(term.Attributes{
+			Fg: term.FromTcellColor(theme.Foreground),
+			Bg: term.FromTcellColor(theme.Background),
+		})
+	}
 }
 
 func (b *bootstrapHandler) packageConfigMergeHook(event idepkg.ConfigMergeEvent) (
@@ -528,6 +544,9 @@ func (b *bootstrapHandler) setupConfiguredIDE(
 	if err := b.subscribeQuickMenuCommand(i); err != nil {
 		errs = append(errs, fmt.Errorf("subscribe quick menu command: %w", err))
 	}
+	if err := b.subscribeThemeReloadCommand(i); err != nil {
+		errs = append(errs, fmt.Errorf("subscribe theme reload command: %w", err))
+	}
 
 	if client.TelemetryEnabled() {
 		err := i.SubscribeEvents(apiclient.TelemetryEvents(), client)
@@ -555,6 +574,181 @@ func (b *bootstrapHandler) scheduleNextTick(fn func()) bool {
 	return b.publishEvent(term.Event{Type: term.EventInterrupt, UserFunc: fn})
 }
 
+// hudLoadTimeout leaves the screenshot time to land within the 5s that
+// runectl waits for it.
+const hudLoadTimeout = 3 * time.Second
+
+// extensionReloadSettle is how long a screenshot waits for the extensions
+// told to fetch their config again to redraw with it. One that takes
+// longer shows its new config in the next screenshot.
+const extensionReloadSettle = 300 * time.Millisecond
+
+// reloadHUDAndScreenshot takes a screenshot that shows i with the HUD of
+// the config file, or with an error notification when the config does not
+// load, and with the extensions that fetched their config again redrawn.
+// i is left as it is if it is no longer the current IDE. It must not run
+// on the event loop.
+func (b *bootstrapHandler) reloadHUDAndScreenshot(i *ide.IDE) {
+	hud, menuImages, err := b.loadHUD(i)
+	ok := b.scheduleNextTick(func() {
+		b.queueScreenshot(b.installHUD(i, hud, menuImages, err))
+	})
+	if !ok {
+		log.Errorf("request screenshot: could not queue screenshot request")
+	}
+}
+
+// loadHUD reads the HUD of the config file for i and the quick menu's
+// sprites, for installHUD to install. It must not run on the event loop.
+func (b *bootstrapHandler) loadHUD(i *ide.IDE) (*ide.HUD, map[string]image.Image, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), hudLoadTimeout)
+	defer cancel()
+	hud, err := i.LoadHUD(ctx)
+	if err != nil {
+		log.Errorf("reload the HUD: %v", err)
+		return nil, nil, err
+	}
+	return hud, readQuickMenuImages(ctx, ide.QuickMenuButtons(hud.Config()), b.storage), nil
+}
+
+// installHUD installs in i what loadHUD returned, or notifies loadErr. i
+// is left as it is if it is no longer the current IDE. It returns how
+// many extension processes were told to fetch their config again. It must
+// run on the event loop.
+func (b *bootstrapHandler) installHUD(
+	i *ide.IDE, hud *ide.HUD, menuImages map[string]image.Image, loadErr error,
+) int {
+	if loadErr != nil {
+		_, err := b.notifications().Notify(browserapi.LevelError,
+			"Could not reload the HUD: %v", loadErr)
+		if err != nil {
+			log.Warnf("notify HUD reload: %v", err)
+		}
+		return 0
+	}
+	if b.currentIDE() != i {
+		return 0
+	}
+	return b.applyHUD(i, hud, menuImages)
+}
+
+// subscribeThemeReloadCommand registers on i the command that applies the
+// HUD of the config file without a screenshot.
+func (b *bootstrapHandler) subscribeThemeReloadCommand(i *ide.IDE) error {
+	man := textapi.CommandManual{
+		Name: cmdThemeReload,
+		Summary: "Reads the config file again and restyles every open workspace " +
+			"without reopening it: window frames, scroll bars and window bars; " +
+			"frame unions; prompts and their buttons; the command prompt frame, " +
+			"separator and manual; the editor and extension status bars; the " +
+			"wallpaper; sounds, the terminal bell and program status sounds; and " +
+			"the GUI quick menu and themes, and its default theme and sound volume " +
+			"when they changed. Images those keys name are read again. Other " +
+			"settings need workspacereload or a restart.",
+	}
+	handler := func(context.Context, textapi.Command) error {
+		go debug.CapturePanicReport(func() {
+			hud, menuImages, err := b.loadHUD(i)
+			ok := b.scheduleNextTick(func() {
+				b.installHUD(i, hud, menuImages, err)
+			})
+			if !ok {
+				log.Errorf("%s: could not queue UI event", cmdThemeReload)
+			}
+		})
+		return nil
+	}
+	return i.SubscribeCommand(man, text.FuncCommandHandler(handler, nil))
+}
+
+// queueScreenshot queues a screenshot, after extensionReloadSettle when
+// signalled extensions are fetching their config again.
+func (b *bootstrapHandler) queueScreenshot(signalled int) {
+	queue := func() {
+		// A screenshot shows the last frame drawn, which this tick's
+		// changes reach only after it ends.
+		if !b.scheduleNextTick(b.screenshot) {
+			log.Errorf("request screenshot: could not queue screenshot request")
+		}
+	}
+	if signalled == 0 {
+		queue()
+		return
+	}
+	b.afterFunc(extensionReloadSettle, queue)
+}
+
+// applyHUD installs hud in i and, unless i has a HUD whose load started
+// later already, applies the app-wide settings of the config hud was
+// read from. menuImages are the quick menu's sprites, read already. It
+// returns how many extension processes were told to fetch their config
+// again. It must run on the event loop.
+func (b *bootstrapHandler) applyHUD(i *ide.IDE, hud *ide.HUD, menuImages map[string]image.Image) int {
+	applied, signalled := i.ApplyHUD(hud)
+	if applied {
+		b.applyGUIConfig(hud.Config(), menuImages)
+	}
+	return signalled
+}
+
+// applyGUIConfig applies the quick menu, sound volume and color themes
+// of cfg. The volume and default theme are applied only when they differ
+// from the ones read last. menuImages are the quick menu's sprites, read
+// already. It must run on the event loop.
+func (b *bootstrapHandler) applyGUIConfig(cfg config.Config, menuImages map[string]image.Image) {
+	menu, menuSounds := quickMenuConfig(cfg)
+	b.setQuickMenu(menu, menuSounds, menuImages)
+
+	guiCfg, ok, err := getGUIConfig(cfg)
+	if err != nil {
+		log.Warnf("reload the GUI config: %v", err)
+	}
+	if !ok {
+		guiCfg = config.NopConfig()
+	}
+	browser := b.browser()
+	if volume := getGUISoundVolume(browser, guiCfg); volume != b.soundVolume {
+		b.soundVolume = volume
+		if b.soundOutput != nil {
+			b.soundOutput.SetVolume(volume)
+		}
+	}
+	if b.g == nil {
+		return
+	}
+	b.applyGUIThemes(guiCfg)
+	name := getGUIDefaultColorTheme(browser, guiCfg)
+	if name == b.defaultTheme {
+		return
+	}
+	b.defaultTheme = name
+	theme, err := b.g.SetTheme(name)
+	if err != nil {
+		_, _ = browser.Notify(browserapi.LevelError,
+			"Could not apply 'gui.default_theme': %v", err)
+		return
+	}
+	b.currentIDE().SetDefaultAttributes(term.Attributes{
+		Fg: term.FromTcellColor(theme.Foreground),
+		Bg: term.FromTcellColor(theme.Background),
+	})
+}
+
+// screenshot captures the last frame the GUI drew. It must run on the
+// event loop.
+func (b *bootstrapHandler) screenshot() {
+	path, err := b.g.Screenshot()
+	if err != nil {
+		log.Errorf("take screenshot: %v", err)
+		return
+	}
+	_, err = b.notifications().Notify(browserapi.LevelInfo,
+		"Screenshot saved to %s", path)
+	if err != nil {
+		log.Warnf("notify screenshot: %v", err)
+	}
+}
+
 // handleTabsClick maximizes the GUI window on a double-click of the
 // tabs bar. Installed on both buildPreIDE and buildConfiguredIDE so
 // the affordance is available during the bootstrap UI as well as the
@@ -577,6 +771,9 @@ func (b *bootstrapHandler) Resize(w, h int) {
 	b.lastResizeW = w
 	b.lastResizeH = h
 	b.inner.Resize(w, h)
+	if b.quickMenuBar != nil {
+		b.quickMenuBar.Resize(w, h)
+	}
 	b.positionQuickMenu(w)
 }
 
@@ -592,7 +789,12 @@ func (b *bootstrapHandler) positionQuickMenu(width int) {
 	glassbar.SetFrame(x, y, w)
 }
 
-func (b *bootstrapHandler) Draw(w term.Writer) { b.inner.Draw(w) }
+func (b *bootstrapHandler) Draw(w term.Writer) {
+	b.inner.Draw(w)
+	if bar := b.visibleQuickMenuBar(); bar != nil {
+		bar.Draw(w)
+	}
+}
 
 func (b *bootstrapHandler) Cursor() (term.Coordinates, term.CursorStyle, bool) {
 	return b.inner.Cursor()
@@ -614,6 +816,9 @@ func (b *bootstrapHandler) Handle(ev term.Event) (exit, handled bool) {
 			return false, true
 		}
 	}
+	if bar := b.visibleQuickMenuBar(); bar != nil && ev.Type == term.EventMouse {
+		return b.handleQuickMenuMouse(bar, ev)
+	}
 	return b.inner.Handle(ev)
 }
 
@@ -623,7 +828,6 @@ func (b *bootstrapHandler) performSwap() error {
 	}
 
 	b.configPath = filepath.Join(b.dataDir, configFilename)
-	b.loadQuickMenu()
 
 	b.mu.Unlock()
 	defer b.mu.Lock()
@@ -664,8 +868,11 @@ func (b *bootstrapHandler) performSwap() error {
 
 // installAppMenu replaces the application menu bar. It must run on the
 // main thread, so callers publish it as an EventInterrupt rather than
-// calling it directly.
+// calling it directly. Without a GUI there is no menu bar to replace.
 func (b *bootstrapHandler) installAppMenu() {
+	if b.g == nil {
+		return
+	}
 	appmenu.Install(
 		appMenus(appMenuKeyBindings(b.config()), b.mergedRecentWorkspaces(),
 			b.appMenuModels(), b.appMenuTutorials(), appMenuQuickMenu{
@@ -731,6 +938,9 @@ func (b *bootstrapHandler) publishAppMenuInstall() {
 // invisible until the window was resized.
 func (b *bootstrapHandler) publishQuickMenuInstall() {
 	b.publishEvent(term.Event{Type: term.EventInterrupt, UserFunc: func() {
+		if b.g == nil {
+			return
+		}
 		glassbar.Install(quickMenuGlassButtons(b.quickMenuButtons()),
 			b.activateQuickMenuButton)
 		b.positionQuickMenu(b.lastResizeW)
@@ -913,6 +1123,12 @@ func (b *bootstrapHandler) Close() error {
 			errs = append(errs, err)
 		}
 		b.preIDE = nil
+	}
+	if b.quickMenuBar != nil {
+		if err := b.quickMenuBar.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		b.quickMenuBar = nil
 	}
 	if b.storage != nil {
 		if err := b.storage.Close(); err != nil {
