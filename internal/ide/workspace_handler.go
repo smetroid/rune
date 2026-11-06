@@ -1637,6 +1637,7 @@ func (h *workspaceManagerHandler) textOpts(
 		text.WithFileExplorer(text.FileExplorerConfig{
 			IndentAttr: cfg.fileExplorerIndentAttr(),
 			IconAttr:   cfg.fileExplorerIconAttr(),
+			IconAttrs:  cfg.fileExplorerIconAttrs(),
 			ReadOnly:   cfg.fileExplorerReadOnly(),
 			EditKey:    cfg.fileExplorerEditKey(),
 			MinWidth:   cfg.fileExplorerMinWidth(),

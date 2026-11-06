@@ -370,6 +370,9 @@ type FileExplorerConfig struct {
 	// glyph (directory, default file, or per-extension override)
 	// drawn after the indent guides.
 	IconAttr term.Attributes
+	// IconAttrs overrides IconAttr for files by extension, keyed with
+	// the leading dot (".go").
+	IconAttrs map[string]term.Attributes
 	// ReadOnly disables every filesystem-mutating edit: buffer edits
 	// are refused before they land, leaving navigation and
 	// expand/collapse intact.

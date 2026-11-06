@@ -4023,6 +4023,24 @@ func TestFileExplorerMinWidthConfig(t *testing.T) {
 	assert.Empty(t, set.errors)
 }
 
+func TestFileExplorerIconAttrsConfig(t *testing.T) {
+	t.Parallel()
+	bare := ideConfig{cfg: map[string]any{}, errors: map[string]error{}}
+	assert.Empty(t, bare.fileExplorerIconAttrs())
+	assert.Empty(t, bare.errors)
+
+	set := ideConfig{cfg: map[string]any{"editor": map[string]any{
+		"file_explorer": map[string]any{"icon_attrs": map[string]any{
+			".go": map[string]any{"fg": "blue"},
+			".py": "not-a-map",
+		}},
+	}}, errors: map[string]error{}}
+	assert.Equal(t, map[string]term.Attributes{
+		".go": {Fg: term.ColorBlue},
+	}, set.fileExplorerIconAttrs())
+	assert.Contains(t, set.errors, "editor.file_explorer.icon_attrs..py")
+}
+
 func TestFileExplorerReadOnlyConfigDefaults(t *testing.T) {
 	t.Parallel()
 	c := ideConfig{cfg: map[string]any{}, errors: map[string]error{}}
