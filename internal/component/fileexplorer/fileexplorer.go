@@ -73,6 +73,10 @@ type Config struct {
 	// term.ColorGray so they recede visually behind file names,
 	// matching the indent guides.
 	IconAttr term.Attributes
+	// IconAttrs overrides IconAttr for files by extension, keyed with
+	// the leading dot (".go"), the same keys as Icons.Extensions.
+	// Directories always use IconAttr.
+	IconAttrs map[string]term.Attributes
 	// Ignore filters out entries whose URI matches the matcher.
 	// Used to hide e.g. `.git/`, `*.swp`, and anything listed in
 	// the workspace's `.gitignore` — the same noise the rest of
@@ -1142,10 +1146,10 @@ func (c *Component) applyIndentAttr(flat []*node) {
 // icon attributes. The icon cell sits immediately after the indent
 // guides at column n.depth * IndentWidth, mirroring renderLine.
 func (c *Component) applyIconAttr(flat []*node) {
-	attr := c.cfg.IconAttr
 	width := c.cfg.IndentWidth
 	cells := c.buf.RawCells()
 	for y, n := range flat {
+		attr := iconAttrFor(n, c.cfg)
 		if y >= len(cells) {
 			break
 		}

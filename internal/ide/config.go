@@ -3396,6 +3396,35 @@ func (c ideConfig) fileExplorerIconAttr() term.Attributes {
 	return attrs
 }
 
+// fileExplorerIconAttrs returns the per-extension icon attributes
+// from editor.file_explorer.icon_attrs, keyed by extension with its
+// leading dot. An invalid entry is reported and skipped so the rest
+// still apply.
+func (c ideConfig) fileExplorerIconAttrs() map[string]term.Attributes {
+	cfg, ok := c.fileExplorer()
+	if !ok {
+		return nil
+	}
+	m, err := cfg.GetMap("icon_attrs")
+	if err != nil {
+		if err != config.ErrNotFound {
+			c.errors["editor.file_explorer.icon_attrs"] = err
+		}
+		return nil
+	}
+	entries := config.MapConfig(m)
+	ret := make(map[string]term.Attributes, len(m))
+	for ext := range m {
+		attrs, err := config.GetAttributes(entries, ext)
+		if err != nil {
+			c.errors["editor.file_explorer.icon_attrs."+ext] = err
+			continue
+		}
+		ret[ext] = attrs
+	}
+	return ret
+}
+
 // fileExplorerReadOnly reports whether the :fexplorer split refuses
 // buffer edits and writes. Defaults to false so the oil.nvim-style
 // editing flow stays on unless the user opts out.

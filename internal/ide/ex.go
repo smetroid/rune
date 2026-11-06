@@ -2254,6 +2254,7 @@ func (e *ex) initFileExplorer() error {
 			IndentWidth: e.config.Tabspaces,
 			IndentAttr:  e.config.FileExplorer.IndentAttr,
 			IconAttr:    e.config.FileExplorer.IconAttr,
+			IconAttrs:   e.config.FileExplorer.IconAttrs,
 			Ignore:      ignore,
 		})
 		if err != nil {
