@@ -714,6 +714,10 @@ config = {
         "file_explorer": {
             "indent_attr": attr(fg = "gray"),
             "icon_attr":   attr(fg = "gray"),
+            # Icon attributes by file extension, overriding icon_attr for
+            # files. Keys include the leading dot, for example
+            # {".go": attr(fg = "cyan"), ".py": attr(fg = "yellow")}.
+            "icon_attrs":  {},
             # When True, the explorer refuses edits and writes; browsing,
             # expanding and opening files still work.
             "read_only":   False,

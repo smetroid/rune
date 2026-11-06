@@ -290,6 +290,23 @@ func TestIconAttrHonorsConfig(t *testing.T) {
 	require.Equal(t, term.ColorRed, rows[1][4].Fg)
 }
 
+func TestIconAttrsOverrideByExtension(t *testing.T) {
+	_, buf, _ := newComp(t, map[string][]mockEntry{
+		"/project": {
+			{name: "main.go"}, {name: "notes.md"}, {name: "src.go", isDir: true},
+		},
+	}, Config{
+		IconAttr:  term.Attributes{Fg: term.ColorGray},
+		IconAttrs: map[string]term.Attributes{".go": {Fg: term.ColorBlue}},
+	})
+	rows := buf.View().RawCells()
+	require.Len(t, rows, 3)
+	// Rows are ordered directories first: src.go/, main.go, notes.md.
+	require.Equal(t, term.ColorGray, rows[0][0].Fg, "directory ignores IconAttrs")
+	require.Equal(t, term.ColorBlue, rows[1][0].Fg, ".go file uses its override")
+	require.Equal(t, term.ColorGray, rows[2][0].Fg, "unlisted extension falls back")
+}
+
 func TestOpenDirectoryIcon(t *testing.T) {
 	c, buf, _ := newComp(t, map[string][]mockEntry{
 		"/project":     {{name: "src", isDir: true}},
