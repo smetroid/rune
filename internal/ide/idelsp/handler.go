@@ -988,6 +988,9 @@ func diagnosticSeverityToLocationPriority(
 	}
 }
 
+// diagnosticSeverityToAttr returns the highlight for a diagnostic. Error,
+// warning and information set a dark foreground so the text stays legible
+// on their light theme backgrounds.
 func diagnosticSeverityToAttr(
 	s semanticapi.DiagnosticSeverity,
 	icons IconSet,
@@ -996,14 +999,17 @@ func diagnosticSeverityToAttr(
 	switch s {
 	case semanticapi.DiagnosticSeverityError:
 		return term.Attributes{
+			Fg: term.ColorBlack,
 			Bg: term.ColorRed,
 		}, icons[key]
 	case semanticapi.DiagnosticSeverityWarning:
 		return term.Attributes{
+			Fg: term.ColorBlack,
 			Bg: term.ColorYellow,
 		}, icons[key]
 	case semanticapi.DiagnosticSeverityInformation:
 		return term.Attributes{
+			Fg: term.ColorBlack,
 			Bg: term.ColorBlue,
 		}, icons[key]
 	default:

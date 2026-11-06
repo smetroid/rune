@@ -268,6 +268,7 @@ func TestCallbackHandler_PublishDiagnostics(t *testing.T) {
 					To:      term.Coordinates{X: 10, Y: 5},
 					Message: "undefined variable",
 					Attr: term.Attributes{
+						Fg: term.ColorBlack,
 						Bg: term.ColorRed,
 					},
 					Icon: "✖",
@@ -309,6 +310,7 @@ func TestCallbackHandler_PublishDiagnostics(t *testing.T) {
 					To:      term.Coordinates{X: 5, Y: 1},
 					Message: "unused var",
 					Attr: term.Attributes{
+						Fg: term.ColorBlack,
 						Bg: term.ColorYellow,
 					},
 					Icon: "▲",
@@ -318,6 +320,7 @@ func TestCallbackHandler_PublishDiagnostics(t *testing.T) {
 					To:      term.Coordinates{X: 8, Y: 3},
 					Message: "syntax error",
 					Attr: term.Attributes{
+						Fg: term.ColorBlack,
 						Bg: term.ColorRed,
 					},
 					Icon: "✖",
@@ -408,6 +411,7 @@ func TestCallbackHandler_PublishDiagnostics(t *testing.T) {
 					To:      term.Coordinates{X: 5, Y: 1},
 					Message: "cannot inline: too complex",
 					Attr: term.Attributes{
+						Fg: term.ColorBlack,
 						Bg: term.ColorRed,
 					},
 					Icon: "✖",
@@ -504,14 +508,14 @@ func TestCallbackHandler_PublishDiagnostics_BySource(t *testing.T) {
 		From:    term.Coordinates{X: 0, Y: 1},
 		To:      term.Coordinates{X: 4, Y: 1},
 		Message: "type error",
-		Attr:    term.Attributes{Bg: term.ColorRed},
+		Attr:    term.Attributes{Fg: term.ColorBlack, Bg: term.ColorRed},
 		Icon:    "✖",
 	}
 	wantRuffLoc := textapi.Location{
 		From:    term.Coordinates{X: 0, Y: 2},
 		To:      term.Coordinates{X: 6, Y: 2},
 		Message: "unused import",
-		Attr:    term.Attributes{Bg: term.ColorYellow},
+		Attr:    term.Attributes{Fg: term.ColorBlack, Bg: term.ColorYellow},
 		Icon:    "▲",
 	}
 	assert.ElementsMatch(t,
@@ -2342,6 +2346,9 @@ func TestDiagnosticSeverityToAttr(t *testing.T) {
 			style := term.Style(attr)
 			assert.Equal(t, tt.wantBg, style.Bg)
 			assert.Equal(t, tt.wantIcon, icon)
+			if tt.severity != semanticapi.DiagnosticSeverityHint {
+				assert.Equal(t, term.ColorBlack, style.Fg)
+			}
 		})
 	}
 }
