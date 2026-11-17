@@ -1102,18 +1102,16 @@ func (t *Component) Pid() workspaceapi.Pid {
 // terminal: either the Component was started with a command that is not a
 // shell, as `terminalnewtab claude` does, or a process other than the one it
 // started is in the foreground, as when a program is run from the shell.
-// Otherwise it reports false, also when that cannot be told, as for a pty on
-// a remote workspace.
+// Otherwise it reports false, also when that cannot be told.
 func (t *Component) programInForeground() bool {
 	if t.runsProgram.Load() {
 		return true
 	}
-	m, ok := t.pty.Master.(interface{ ForegroundPgrp() (int, error) })
 	pid := t.Pid()
-	if !ok || pid == 0 {
+	if pid == 0 {
 		return false
 	}
-	pgrp, err := m.ForegroundPgrp()
+	pgrp, err := t.terminal.ForegroundProcessGroup(t.pty)
 	return err == nil && pgrp != int(pid)
 }
 
