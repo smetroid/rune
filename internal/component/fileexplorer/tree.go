@@ -157,6 +157,18 @@ func iconFor(n *node, cfg Config) rune {
 	return cfg.Icons.Default
 }
 
+// iconAttrFor returns the attributes for n's icon: the per-extension
+// entry in cfg.IconAttrs when a file's extension has one, else
+// cfg.IconAttr. Directories always use cfg.IconAttr.
+func iconAttrFor(n *node, cfg Config) term.Attributes {
+	if !n.isDir {
+		if attr, ok := cfg.IconAttrs[filepath.Ext(n.name)]; ok {
+			return attr
+		}
+	}
+	return cfg.IconAttr
+}
+
 // parseCellRow parses a single buffer row into a parsedEntry. If the
 // row is blank (or only whitespace after the icon is stripped), it
 // returns (_, false) so the caller skips it. Trailing whitespace is
